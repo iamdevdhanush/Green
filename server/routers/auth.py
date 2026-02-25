@@ -4,6 +4,7 @@ GreenOps Authentication Router
 - Refresh token rotation
 - Logout / revoke tokens
 - Token verification and user info
+- ensure_admin_exists: safe, idempotent, fully enum-correct
 """
 
 from datetime import datetime, timezone, timedelta
@@ -12,10 +13,11 @@ from typing import Optional
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError, DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# Import UserRole from database — the single source of truth for this enum.
 from database import RefreshToken, User, UserRole, get_db
 from utils.auth import (
     create_access_token,
@@ -33,6 +35,35 @@ router = APIRouter()
 ACCOUNT_LOCKOUT_THRESHOLD = 10
 ACCOUNT_LOCKOUT_MINUTES = 15
 
+
+# ---------------------------------------------------------------------------
+# Helper: safely coerce a raw string or enum to UserRole
+# ---------------------------------------------------------------------------
+
+def _coerce_role(value) -> UserRole:
+    """
+    Accept a UserRole member OR a string and always return a UserRole member.
+
+    Raises ValueError with a descriptive message if the value is not valid.
+
+    Examples
+    --------
+    _coerce_role(UserRole.ADMIN)  -> UserRole.ADMIN
+    _coerce_role("admin")         -> UserRole.ADMIN
+    _coerce_role("ADMIN")         -> UserRole.ADMIN  (normalised via _missing_)
+    _coerce_role("superuser")     -> raises ValueError
+    """
+    if isinstance(value, UserRole):
+        return value
+    if isinstance(value, str):
+        # UserRole._missing_ handles case-insensitive normalisation
+        return UserRole(value)
+    raise ValueError(f"Cannot coerce type {type(value)!r} to UserRole")
+
+
+# ---------------------------------------------------------------------------
+# Pydantic schemas
+# ---------------------------------------------------------------------------
 
 class LoginRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=64)
@@ -63,6 +94,10 @@ class TokenResponse(BaseModel):
     expires_at: datetime
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
 @router.post("/login", response_model=LoginResponse)
 async def login(
     payload: LoginRequest,
@@ -79,6 +114,7 @@ async def login(
     user = result.scalar_one_or_none()
 
     if not user or not user.is_active:
+        # Perform a dummy verify to prevent timing attacks even when user not found
         verify_password("dummy", "$argon2id$v=19$m=65536,t=3,p=4$dummysaltdummysalt$dummyhashvalue00")
         logger.warning("login_failed_user_not_found", username=payload.username, ip=ip_address)
         raise HTTPException(
@@ -122,10 +158,14 @@ async def login(
     if needs_rehash(user.password_hash):
         user.password_hash = hash_password(payload.password)
 
+    # Safely coerce role to UserRole enum then extract string value for JWT
+    role_enum = _coerce_role(user.role)
+    role_value = role_enum.value  # always "admin" or "viewer"
+
     access_token, expires_at = create_access_token(
         user_id=user.id,
         username=user.username,
-        role=user.role.value if hasattr(user.role, 'value') else user.role,
+        role=role_value,
     )
 
     raw_refresh, refresh_hash, refresh_expires = create_refresh_token()
@@ -142,8 +182,6 @@ async def login(
     await db.commit()
 
     logger.info("login_success", username=user.username, ip=ip_address)
-
-    role_value = user.role.value if hasattr(user.role, 'value') else user.role
 
     return LoginResponse(
         access_token=access_token,
@@ -201,7 +239,7 @@ async def refresh_token(
     db_token.revoked = True
     db_token.revoked_at = datetime.now(timezone.utc)
 
-    role_value = user.role.value if hasattr(user.role, 'value') else user.role
+    role_value = _coerce_role(user.role).value
 
     access_token, expires_at = create_access_token(
         user_id=user.id,
@@ -241,7 +279,7 @@ async def logout(
 @router.get("/verify")
 async def verify_token(current_user: User = Depends(get_current_user)):
     """Verify the current access token is valid."""
-    role_value = current_user.role.value if hasattr(current_user.role, 'value') else current_user.role
+    role_value = _coerce_role(current_user.role).value
     return {
         "valid": True,
         "username": current_user.username,
@@ -252,7 +290,7 @@ async def verify_token(current_user: User = Depends(get_current_user)):
 @router.get("/me")
 async def get_me(current_user: User = Depends(get_current_user)):
     """Get current authenticated user info."""
-    role_value = current_user.role.value if hasattr(current_user.role, 'value') else current_user.role
+    role_value = _coerce_role(current_user.role).value
     return {
         "id": current_user.id,
         "username": current_user.username,
@@ -262,34 +300,113 @@ async def get_me(current_user: User = Depends(get_current_user)):
     }
 
 
-async def ensure_admin_exists(db: AsyncSession):
+# ---------------------------------------------------------------------------
+# Startup helper
+# ---------------------------------------------------------------------------
+
+async def ensure_admin_exists(db: AsyncSession) -> None:
+    """
+    Idempotent bootstrap function.
+
+    Guarantees exactly one admin user exists at startup.
+
+    Safety guarantees
+    -----------------
+    - If the admin user already exists → returns immediately, no DB write.
+    - role is ALWAYS set to UserRole.ADMIN (the enum member), never a string.
+    - IntegrityError (duplicate username race condition) is caught and swallowed.
+    - DBAPIError (enum mismatch, DB not ready, etc.) is caught, logged with
+      full details, then re-raised so the caller (lifespan) can fail fast.
+    - All DB operations are wrapped in try/except with explicit rollback.
+    """
     from config import get_settings
     settings = get_settings()
 
-    result = await db.execute(
-        select(User).where(User.username == settings.INITIAL_ADMIN_USERNAME)
-    )
-    existing = result.scalar_one_or_none()
-    if existing:
-        return
-
-    admin_password = settings.INITIAL_ADMIN_PASSWORD
-    if not admin_password:
-        import secrets
-        admin_password = secrets.token_urlsafe(16)
-        logger.warning("generated_admin_password", password=admin_password)
-
-    admin = User(
-        username=settings.INITIAL_ADMIN_USERNAME,
-        password_hash=hash_password(admin_password),
-        role=UserRole.ADMIN,
-        is_active=True,
-    )
-
     try:
+        # ── 1. Verify the user_role enum exists in PostgreSQL ──────────────
+        try:
+            await db.execute(text("SELECT 'admin'::user_role"))
+        except DBAPIError as exc:
+            logger.error(
+                "startup_enum_check_failed",
+                detail=(
+                    "PostgreSQL user_role enum is missing or does not contain 'admin'. "
+                    "Run migration 001_initial_schema.sql to create it."
+                ),
+                original_error=str(exc),
+            )
+            await db.rollback()
+            raise
+
+        # ── 2. Check whether admin already exists ─────────────────────────
+        result = await db.execute(
+            select(User).where(User.username == settings.INITIAL_ADMIN_USERNAME)
+        )
+        existing = result.scalar_one_or_none()
+
+        if existing:
+            logger.info(
+                "admin_already_exists",
+                username=settings.INITIAL_ADMIN_USERNAME,
+                role=_coerce_role(existing.role).value,
+            )
+            return  # nothing to do — idempotent
+
+        # ── 3. Determine password ──────────────────────────────────────────
+        admin_password = settings.INITIAL_ADMIN_PASSWORD
+        if not admin_password:
+            import secrets as _secrets
+            admin_password = _secrets.token_urlsafe(16)
+            logger.warning(
+                "generated_random_admin_password",
+                password=admin_password,
+                hint="Set INITIAL_ADMIN_PASSWORD in .env to avoid this.",
+            )
+
+        # ── 4. Create admin with explicit UserRole.ADMIN enum member ───────
+        #
+        #   DO NOT use role="ADMIN" or role="admin" here.
+        #   UserRole.ADMIN is the enum *member*; SQLAlchemy + values_callable
+        #   will translate it to the string "admin" when talking to PostgreSQL.
+        #
+        admin = User(
+            username=settings.INITIAL_ADMIN_USERNAME,
+            password_hash=hash_password(admin_password),
+            role=UserRole.ADMIN,   # ← enum member, never a raw string
+            is_active=True,
+        )
+
         db.add(admin)
         await db.commit()
-        logger.info("admin_user_created", username=settings.INITIAL_ADMIN_USERNAME)
+        logger.info(
+            "admin_user_created",
+            username=settings.INITIAL_ADMIN_USERNAME,
+            role=UserRole.ADMIN.value,  # logs "admin"
+        )
+
     except IntegrityError:
+        # Race condition: another worker created the admin between our SELECT
+        # and INSERT.  This is harmless — swallow and continue.
         await db.rollback()
-        logger.info("admin_already_exists", username=settings.INITIAL_ADMIN_USERNAME)
+        logger.info(
+            "admin_creation_race_condition_handled",
+            username=settings.INITIAL_ADMIN_USERNAME,
+        )
+
+    except DBAPIError as exc:
+        await db.rollback()
+        logger.error(
+            "ensure_admin_exists_db_error",
+            error=str(exc),
+            detail=(
+                "A database-level error occurred while creating the admin user. "
+                "Common causes: enum mismatch (value 'ADMIN' sent instead of 'admin'), "
+                "DB not ready, or missing migration."
+            ),
+        )
+        raise  # propagate to lifespan so the server fails fast with a clear error
+
+    except Exception as exc:
+        await db.rollback()
+        logger.error("ensure_admin_exists_unexpected_error", error=str(exc))
+        raise

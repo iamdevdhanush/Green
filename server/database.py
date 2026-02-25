@@ -43,13 +43,65 @@ class MachineStatus(str, enum.Enum):
     OFFLINE = "offline"
 
 
-class UserRole(enum.Enum):
+class UserRole(str, enum.Enum):
+    """
+    UserRole enum.
+
+    Inherits from str so that:
+      - UserRole.ADMIN == "admin" is True
+      - SQLAlchemy stores the .value ("admin") not the .name ("ADMIN")
+      - JSON serialisation works without extra .value calls
+      - Comparison against DB-returned strings works transparently
+
+    PostgreSQL enum type user_role must contain exactly: ('admin', 'viewer')
+    """
     ADMIN = "admin"
     VIEWER = "viewer"
 
+    @classmethod
+    def _missing_(cls, value: object):
+        """
+        Handle case-insensitive lookup and raise a clear error for unknown values.
+        Called by Python when UserRole(value) fails the normal lookup.
 
-_machine_status_pg = Enum(MachineStatus, name="machine_status", create_type=False)
-_user_role_pg = Enum(UserRole, name="user_role", create_type=False)
+        Examples
+        --------
+        UserRole("ADMIN")   -> UserRole.ADMIN   (normalised)
+        UserRole("Admin")   -> UserRole.ADMIN   (normalised)
+        UserRole("unknown") -> raises ValueError with helpful message
+        """
+        if isinstance(value, str):
+            normalised = value.strip().lower()
+            for member in cls:
+                if member.value == normalised:
+                    return member
+        raise ValueError(
+            f"'{value}' is not a valid {cls.__name__}. "
+            f"Valid values: {[m.value for m in cls]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# SQLAlchemy Enum types
+#
+# values_callable forces SQLAlchemy to use the enum *values* ("admin",
+# "viewer") when communicating with PostgreSQL, not the *names* ("ADMIN",
+# "VIEWER").  Without this the driver sends "ADMIN" which PostgreSQL rejects
+# because its enum type stores lowercase values.
+# ---------------------------------------------------------------------------
+_machine_status_pg = Enum(
+    MachineStatus,
+    name="machine_status",
+    create_type=False,
+    values_callable=lambda obj: [e.value for e in obj],
+)
+
+_user_role_pg = Enum(
+    UserRole,
+    name="user_role",
+    create_type=False,
+    values_callable=lambda obj: [e.value for e in obj],
+)
 
 
 class User(Base):
@@ -57,6 +109,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(64), unique=True, nullable=False, index=True)
     password_hash = Column(String(256), nullable=False)
+    # Always default to UserRole.ADMIN (the enum member), never a raw string.
     role = Column(_user_role_pg, default=UserRole.ADMIN, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
     failed_login_attempts = Column(Integer, default=0, nullable=False)
