@@ -1,10 +1,28 @@
+i##############################################################################
+# GreenOps — Dockerfile.nginx
+#
+# Removes the default nginx conf (which conflicts with our custom conf)
+# and copies our nginx.conf + conf.d/ into the image.
+##############################################################################
+
 FROM nginx:1.25-alpine
 
-COPY nginx/nginx.conf /etc/nginx/nginx.conf
-COPY nginx/conf.d/ /etc/nginx/conf.d/
+# Remove the default config that ships with the nginx image.
+# It defines a server {} on port 80 that would conflict with greenops.conf.
+RUN rm -f /etc/nginx/conf.d/default.conf
 
-RUN mkdir -p /var/log/nginx && \
-    touch /var/log/nginx/access.log /var/log/nginx/error.log
+# Copy our nginx configuration
+COPY nginx/nginx.conf      /etc/nginx/nginx.conf
+COPY nginx/conf.d/         /etc/nginx/conf.d/
+
+# Cert directory (empty on first run; mounted as volume in compose)
+RUN mkdir -p /etc/nginx/certs
+
+# Validate config at build time — catches syntax errors before deployment
+RUN nginx -t
+
+RUN mkdir -p /var/log/nginx \
+    && touch /var/log/nginx/access.log /var/log/nginx/error.log
 
 EXPOSE 80
 

@@ -1,30 +1,68 @@
-FROM python:3.11-slim AS builder
-WORKDIR /build
-RUN apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev && rm -rf /var/lib/apt/lists/*
-COPY requirements.txt .
-RUN pip install --upgrade pip && pip install --no-cache-dir --prefix=/install -r requirements.txt
+##############################################################################
+# GreenOps — Dockerfile.server
+#
+# Multi-stage build:
+#   stage 1 (builder)  — compile Python deps into /install
+#   stage 2 (runtime)  — minimal runtime image, non-root user
+#
+# Multi-worker race condition fix:
+#   gunicorn.conf.py sets preload_app = True.
+#   This makes Gunicorn import and execute the application (including lifespan
+#   startup) ONCE in the master process, then fork workers that inherit the
+#   already-initialized state. ensure_admin_exists() only runs once.
+##############################################################################
 
+# ── Stage 1: Build ──────────────────────────────────────────────────────────
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+# Install build-time system deps only
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        gcc \
+        libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+
+RUN pip install --upgrade pip \
+    && pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+
+# ── Stage 2: Runtime ────────────────────────────────────────────────────────
 FROM python:3.11-slim AS runtime
-RUN groupadd -r greenops && useradd -r -g greenops greenops
-RUN apt-get update && apt-get install -y --no-install-recommends libpq5 curl && rm -rf /var/lib/apt/lists/*
+
+# Runtime system deps only (no gcc, no headers)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libpq5 \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root user for security
+RUN groupadd -r greenops \
+    && useradd -r -g greenops -d /app -s /sbin/nologin greenops
+
+# Copy compiled dependencies from builder
 COPY --from=builder /install /usr/local
+
 WORKDIR /app
-RUN chown greenops:greenops /app
+
+# Copy application code
 COPY --chown=greenops:greenops server/ /app/
-COPY --chown=greenops:greenops requirements.txt /app/
+
+RUN chown -R greenops:greenops /app
+
 USER greenops
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+
 EXPOSE 8000
-CMD ["gunicorn", "main:app", \
-    "--worker-class", "uvicorn.workers.UvicornWorker", \
-    "--workers", "4", \
-    "--bind", "0.0.0.0:8000", \
-    "--timeout", "60", \
-    "--keep-alive", "5", \
-    "--max-requests", "1000", \
-    "--max-requests-jitter", "100", \
-    "--access-logfile", "-", \
-    "--error-logfile", "-", \
-    "--log-level", "info", \
-    "--forwarded-allow-ips", "*"]
+
+# Docker-level healthcheck (backup to compose healthcheck)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -sf http://localhost:8000/health | grep -q '"status":"healthy"' || exit 1
+
+# CMD uses gunicorn.conf.py which sets preload_app = True.
+# Do NOT pass --workers here; let gunicorn.conf.py control it so the
+# WORKERS env var is respected at runtime without rebuilding the image.
+CMD ["gunicorn", "main:app", "--config", "gunicorn.conf.py"]
