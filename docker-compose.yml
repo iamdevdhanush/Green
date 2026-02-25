@@ -1,72 +1,200 @@
-version: "3.9"
+# =============================================================================
+# GreenOps — Production Docker Compose
+# =============================================================================
+# Architecture:
+#   internet → nginx (80) → [server:8000 | dashboard:3000]
+#   server → db:5432  (internal only, never exposed)
+#
+# Startup order (enforced by healthchecks):
+#   db (healthy) → server (healthy) → dashboard → nginx
+#
+# Networks:
+#   backend  — server + db only  (db is invisible to nginx/dashboard)
+#   frontend — nginx + server + dashboard
+#
+# =============================================================================
 
 services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 16
+  # ---------------------------------------------------------------------------
   db:
     image: postgres:16-alpine
     container_name: greenops-db
     restart: unless-stopped
+
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-greenops}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-greenops}
-      POSTGRES_DB: ${POSTGRES_DB:-greenops}
+      POSTGRES_USER:     ${POSTGRES_USER:-greenops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}           # required — no default
+      POSTGRES_DB:       ${POSTGRES_DB:-greenops}
+      # Tuning for small-to-medium SaaS workload on a 2-4 vCPU VPS
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Migration SQL is run once on first container start (initdb.d)
       - ./migrations:/docker-entrypoint-initdb.d:ro
+
     networks:
       - backend
+
+    # DB is NEVER exposed to host.  Server connects via internal Docker DNS.
     expose:
       - "5432"
 
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-greenops} -d ${POSTGRES_DB:-greenops}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+    # Limit DB memory on shared VPS
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # FastAPI Backend (Gunicorn + Uvicorn workers)
+  # ---------------------------------------------------------------------------
   server:
     build:
       context: .
       dockerfile: Dockerfile.server
     container_name: greenops-server
     restart: unless-stopped
+
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-greenops}:${POSTGRES_PASSWORD:-greenops}@db:5432/${POSTGRES_DB:-greenops}
-      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-supersecret}
+      # Constructed from individual vars so DB password is never double-stored
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-greenops}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-greenops}"
+
+      ENV:                        ${ENV:-production}
+      DEBUG:                      ${DEBUG:-false}
+      JWT_SECRET_KEY:             ${JWT_SECRET_KEY}          # required
+      INITIAL_ADMIN_USERNAME:     ${INITIAL_ADMIN_USERNAME:-admin}
+      INITIAL_ADMIN_PASSWORD:     ${INITIAL_ADMIN_PASSWORD}  # required
+      CORS_ORIGINS:               ${CORS_ORIGINS:-http://localhost}
+      ACCESS_TOKEN_EXPIRE_MINUTES:  ${ACCESS_TOKEN_EXPIRE_MINUTES:-60}
+      REFRESH_TOKEN_EXPIRE_DAYS:    ${REFRESH_TOKEN_EXPIRE_DAYS:-30}
+      IDLE_POWER_WATTS:           ${IDLE_POWER_WATTS:-65}
+      ACTIVE_POWER_WATTS:         ${ACTIVE_POWER_WATTS:-120}
+      ELECTRICITY_COST_PER_KWH:   ${ELECTRICITY_COST_PER_KWH:-0.12}
+      LOG_LEVEL:                  ${LOG_LEVEL:-INFO}
+      # Gunicorn: 2×vCPU+1 is the standard formula; cap at 4 for a VPS
+      WORKERS:                    ${WORKERS:-4}
+
     depends_on:
-      - db
+      db:
+        condition: service_healthy   # wait for pg_isready before starting
+
     networks:
       - backend
       - frontend
-    ports:
-      - "8000:8000"
 
+    # NOT exposed to host — nginx proxies to server:8000 internally.
+    expose:
+      - "8000"
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s   # allow Gunicorn workers + DB init to complete
+
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # Next.js Dashboard
+  # ---------------------------------------------------------------------------
   dashboard:
     build:
       context: .
       dockerfile: Dockerfile.dashboard
     container_name: greenops-dashboard
     restart: unless-stopped
+
+    environment:
+      NODE_ENV: production
+
     depends_on:
-      - server
+      server:
+        condition: service_healthy   # don't start until API is ready
+
     networks:
       - frontend
+
     expose:
       - "3000"
 
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ---------------------------------------------------------------------------
+  # Nginx Reverse Proxy — the ONLY service with a host port binding
+  # ---------------------------------------------------------------------------
   nginx:
-    image: nginx:1.25-alpine
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
     container_name: greenops-nginx
     restart: unless-stopped
+
     ports:
-      - "80:80"
+      - "${HTTP_PORT:-80}:80"
+      # Uncomment when TLS is configured:
+      # - "${HTTPS_PORT:-443}:443"
+
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/conf.d/greenops.conf:/etc/nginx/conf.d/greenops.conf:ro
+      # Mount certs directory (empty is fine until TLS is added)
+      - ./nginx/certs:/etc/nginx/certs:ro
+
     depends_on:
-      - server
-      - dashboard
+      server:
+        condition: service_healthy
+      dashboard:
+        condition: service_healthy
+
     networks:
       - frontend
 
+    healthcheck:
+      test: ["CMD-SHELL", "nginx -t && wget -qO- http://localhost/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+# =============================================================================
+# Volumes
+# =============================================================================
 volumes:
   postgres_data:
+    driver: local
 
+# =============================================================================
+# Networks
+# =============================================================================
 networks:
+  # backend: server ↔ db only.  db is invisible to nginx and dashboard.
   backend:
     driver: bridge
+    internal: false   # server needs outbound for DNS/updates if required
+
+  # frontend: nginx ↔ server ↔ dashboard
   frontend:
     driver: bridge
