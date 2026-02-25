@@ -1,4 +1,1 @@
-# GreenOps Agent Requirements
-# Core: stdlib only (no external deps required)
-# Optional: psutil for better CPU/memory detection (recommended)
 psutil>=5.9.0

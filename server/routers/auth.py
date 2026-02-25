@@ -3,7 +3,7 @@ GreenOps Authentication Router
 - Login with username/password -> access + refresh tokens
 - Refresh token rotation
 - Logout / revoke tokens
-- Token verification
+- Token verification and user info
 """
 
 from datetime import datetime, timezone, timedelta
@@ -34,10 +34,6 @@ ACCOUNT_LOCKOUT_THRESHOLD = 10
 ACCOUNT_LOCKOUT_MINUTES = 15
 
 
-# ============================
-# Request / Response Models
-# ============================
-
 class LoginRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=64)
     password: str = Field(..., min_length=1, max_length=256)
@@ -67,10 +63,6 @@ class TokenResponse(BaseModel):
     expires_at: datetime
 
 
-# ============================
-# Login
-# ============================
-
 @router.post("/login", response_model=LoginResponse)
 async def login(
     payload: LoginRequest,
@@ -87,7 +79,7 @@ async def login(
     user = result.scalar_one_or_none()
 
     if not user or not user.is_active:
-        verify_password("dummy", "$argon2id$v=19$m=65536,t=3,p=4$dummy$dummy")
+        verify_password("dummy", "$argon2id$v=19$m=65536,t=3,p=4$dummysaltdummysalt$dummyhashvalue00")
         logger.warning("login_failed_user_not_found", username=payload.username, ip=ip_address)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -123,7 +115,6 @@ async def login(
             detail={"error": "invalid_credentials", "message": "Invalid username or password."},
         )
 
-    # Successful login
     user.failed_login_attempts = 0
     user.locked_until = None
     user.last_login = datetime.now(timezone.utc)
@@ -134,7 +125,7 @@ async def login(
     access_token, expires_at = create_access_token(
         user_id=user.id,
         username=user.username,
-        role=user.role.value,
+        role=user.role.value if hasattr(user.role, 'value') else user.role,
     )
 
     raw_refresh, refresh_hash, refresh_expires = create_refresh_token()
@@ -152,18 +143,16 @@ async def login(
 
     logger.info("login_success", username=user.username, ip=ip_address)
 
+    role_value = user.role.value if hasattr(user.role, 'value') else user.role
+
     return LoginResponse(
         access_token=access_token,
         refresh_token=raw_refresh,
         expires_at=expires_at,
-        role=user.role.value,
+        role=role_value,
         username=user.username,
     )
 
-
-# ============================
-# Refresh
-# ============================
 
 @router.post("/refresh", response_model=TokenResponse)
 async def refresh_token(
@@ -186,7 +175,7 @@ async def refresh_token(
             detail={"error": "invalid_token", "message": "Invalid or expired refresh token."},
         )
 
-    if db_token.expires_at < datetime.now(timezone.utc):
+    if db_token.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
         db_token.revoked = True
         db_token.revoked_at = datetime.now(timezone.utc)
         await db.commit()
@@ -212,20 +201,18 @@ async def refresh_token(
     db_token.revoked = True
     db_token.revoked_at = datetime.now(timezone.utc)
 
+    role_value = user.role.value if hasattr(user.role, 'value') else user.role
+
     access_token, expires_at = create_access_token(
         user_id=user.id,
         username=user.username,
-        role=user.role.value,
+        role=role_value,
     )
 
     await db.commit()
 
     return TokenResponse(access_token=access_token, expires_at=expires_at)
 
-
-# ============================
-# Logout
-# ============================
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(
@@ -251,9 +238,29 @@ async def logout(
     logger.info("logout", username=current_user.username)
 
 
-# ============================
-# Admin Bootstrap (Race Safe)
-# ============================
+@router.get("/verify")
+async def verify_token(current_user: User = Depends(get_current_user)):
+    """Verify the current access token is valid."""
+    role_value = current_user.role.value if hasattr(current_user.role, 'value') else current_user.role
+    return {
+        "valid": True,
+        "username": current_user.username,
+        "role": role_value,
+    }
+
+
+@router.get("/me")
+async def get_me(current_user: User = Depends(get_current_user)):
+    """Get current authenticated user info."""
+    role_value = current_user.role.value if hasattr(current_user.role, 'value') else current_user.role
+    return {
+        "id": current_user.id,
+        "username": current_user.username,
+        "role": role_value,
+        "last_login": current_user.last_login,
+        "created_at": current_user.created_at,
+    }
+
 
 async def ensure_admin_exists(db: AsyncSession):
     from config import get_settings
@@ -270,15 +277,12 @@ async def ensure_admin_exists(db: AsyncSession):
     if not admin_password:
         import secrets
         admin_password = secrets.token_urlsafe(16)
-        logger.warning(
-            "generated_admin_password",
-            password=admin_password,
-        )
+        logger.warning("generated_admin_password", password=admin_password)
 
     admin = User(
         username=settings.INITIAL_ADMIN_USERNAME,
         password_hash=hash_password(admin_password),
-        role=UserRole.ADMIN.value,
+        role=UserRole.ADMIN,
         is_active=True,
     )
 

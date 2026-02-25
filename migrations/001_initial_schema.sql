@@ -1,11 +1,6 @@
--- GreenOps Initial Schema Migration
--- Applied automatically via Docker Compose on first start
--- For manual apply: psql $DATABASE_URL < migrations/001_initial_schema.sql
-
--- Extensions
+-- GreenOps Initial Schema
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- Enums
 DO $$ BEGIN
     CREATE TYPE machine_status AS ENUM ('online', 'idle', 'offline');
 EXCEPTION WHEN duplicate_object THEN null;
@@ -16,7 +11,6 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN null;
 END $$;
 
--- Users table
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     username VARCHAR(64) UNIQUE NOT NULL,
@@ -31,7 +25,6 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE INDEX IF NOT EXISTS ix_users_username ON users(username);
 
--- Refresh tokens table
 CREATE TABLE IF NOT EXISTS refresh_tokens (
     id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -46,7 +39,6 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 CREATE INDEX IF NOT EXISTS ix_refresh_tokens_user_id ON refresh_tokens(user_id);
 CREATE INDEX IF NOT EXISTS ix_refresh_tokens_token_hash ON refresh_tokens(token_hash);
 
--- Machines table
 CREATE TABLE IF NOT EXISTS machines (
     id SERIAL PRIMARY KEY,
     mac_address VARCHAR(17) UNIQUE NOT NULL,
@@ -68,7 +60,6 @@ CREATE INDEX IF NOT EXISTS ix_machines_mac_address ON machines(mac_address);
 CREATE INDEX IF NOT EXISTS ix_machines_status ON machines(status);
 CREATE INDEX IF NOT EXISTS ix_machines_status_last_seen ON machines(status, last_seen);
 
--- Heartbeats table
 CREATE TABLE IF NOT EXISTS heartbeats (
     id BIGSERIAL PRIMARY KEY,
     machine_id INTEGER NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
@@ -82,7 +73,6 @@ CREATE TABLE IF NOT EXISTS heartbeats (
 CREATE INDEX IF NOT EXISTS ix_heartbeats_machine_id_timestamp ON heartbeats(machine_id, timestamp DESC);
 CREATE INDEX IF NOT EXISTS ix_heartbeats_timestamp ON heartbeats(timestamp DESC);
 
--- Agent tokens table
 CREATE TABLE IF NOT EXISTS agent_tokens (
     id SERIAL PRIMARY KEY,
     machine_id INTEGER NOT NULL UNIQUE REFERENCES machines(id) ON DELETE CASCADE,
@@ -94,7 +84,6 @@ CREATE TABLE IF NOT EXISTS agent_tokens (
 CREATE INDEX IF NOT EXISTS ix_agent_tokens_machine_id ON agent_tokens(machine_id);
 CREATE INDEX IF NOT EXISTS ix_agent_tokens_token_hash ON agent_tokens(token_hash);
 
--- Updated at trigger
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -108,6 +97,3 @@ CREATE TRIGGER update_users_updated_at
     BEFORE UPDATE ON users
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
-
--- Cleanup old heartbeats (run periodically via cron or pg_cron)
--- DELETE FROM heartbeats WHERE timestamp < NOW() - INTERVAL '90 days';

@@ -1,35 +1,56 @@
-import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
-import { authAPI } from '../api/client';
+'use client';
+import React, { createContext, useContext, useEffect, useState, useCallback, ReactNode } from 'react';
+import { authAPI } from '@/lib/api';
 
-const AuthContext = createContext(null);
+interface User {
+  username: string;
+  role: string;
+}
 
-export function AuthProvider({ children }) {
-  const [user, setUser] = useState(null);
+interface AuthContextType {
+  user: User | null;
+  loading: boolean;
+  isAuthenticated: boolean;
+  login: (username: string, password: string) => Promise<User>;
+  logout: () => Promise<void>;
+}
+
+const AuthContext = createContext<AuthContextType | null>(null);
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const loadUserFromStorage = useCallback(async () => {
+  const loadUser = useCallback(async () => {
     const token = localStorage.getItem('access_token');
     if (!token) { setLoading(false); return; }
-    const storedUser = localStorage.getItem('user');
-    if (storedUser) { try { setUser(JSON.parse(storedUser)); } catch {} }
+    const stored = localStorage.getItem('user');
+    if (stored) {
+      try { setUser(JSON.parse(stored)); } catch {}
+    }
     try {
       const { data } = await authAPI.verify();
       if (data.valid) {
         const { data: me } = await authAPI.me();
         setUser(me);
         localStorage.setItem('user', JSON.stringify(me));
-      } else { clearAuth(); }
-    } catch { clearAuth(); }
-    finally { setLoading(false); }
+      } else {
+        clearAuth();
+      }
+    } catch {
+      clearAuth();
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
-  useEffect(() => { loadUserFromStorage(); }, [loadUserFromStorage]);
+  useEffect(() => { loadUser(); }, [loadUser]);
 
-  const login = async (username, password) => {
+  const login = async (username: string, password: string): Promise<User> => {
     const { data } = await authAPI.login(username, password);
     localStorage.setItem('access_token', data.access_token);
     localStorage.setItem('refresh_token', data.refresh_token);
-    const userInfo = { username: data.username, role: data.role };
+    const userInfo: User = { username: data.username, role: data.role };
     localStorage.setItem('user', JSON.stringify(userInfo));
     setUser(userInfo);
     return userInfo;

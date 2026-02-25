@@ -1,23 +1,11 @@
-"""
-GreenOps Database - Async SQLAlchemy with PostgreSQL
-"""
+"""GreenOps Database - Async SQLAlchemy with PostgreSQL"""
 import enum
 from datetime import datetime
 from typing import AsyncGenerator
 
 from sqlalchemy import (
-    BigInteger,
-    Boolean,
-    Column,
-    DateTime,
-    Enum,
-    Float,
-    ForeignKey,
-    Index,
-    Integer,
-    String,
-    Text,
-    text,
+    BigInteger, Boolean, Column, DateTime, Enum, Float,
+    ForeignKey, Index, Integer, String, Text, text,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -26,7 +14,6 @@ from config import get_settings
 
 settings = get_settings()
 
-# Create async engine
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,
@@ -61,22 +48,12 @@ class UserRole(enum.Enum):
     VIEWER = "viewer"
 
 
-# Explicit PostgreSQL type names — MUST match migration SQL exactly
-_machine_status_pg = Enum(
-    MachineStatus,
-    name="machine_status",
-    create_type=False,   # already created by migration SQL
-)
-_user_role_pg = Enum(
-    UserRole,
-    name="user_role",
-    create_type=False,   # already created by migration SQL
-)
+_machine_status_pg = Enum(MachineStatus, name="machine_status", create_type=False)
+_user_role_pg = Enum(UserRole, name="user_role", create_type=False)
 
 
 class User(Base):
     __tablename__ = "users"
-
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(64), unique=True, nullable=False, index=True)
     password_hash = Column(String(256), nullable=False)
@@ -87,13 +64,11 @@ class User(Base):
     last_login = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=text("NOW()"), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=text("NOW()"), onupdate=datetime.utcnow, nullable=False)
-
     refresh_tokens = relationship("RefreshToken", back_populates="user", cascade="all, delete-orphan")
 
 
 class RefreshToken(Base):
     __tablename__ = "refresh_tokens"
-
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     token_hash = Column(String(256), unique=True, nullable=False, index=True)
@@ -103,13 +78,11 @@ class RefreshToken(Base):
     revoked_at = Column(DateTime(timezone=True), nullable=True)
     user_agent = Column(String(256), nullable=True)
     ip_address = Column(String(64), nullable=True)
-
     user = relationship("User", back_populates="refresh_tokens")
 
 
 class Machine(Base):
     __tablename__ = "machines"
-
     id = Column(Integer, primary_key=True, index=True)
     mac_address = Column(String(17), unique=True, nullable=False, index=True)
     hostname = Column(String(255), nullable=False)
@@ -125,18 +98,13 @@ class Machine(Base):
     energy_cost_usd = Column(Float, default=0.0, nullable=False)
     agent_version = Column(String(32), nullable=True)
     notes = Column(Text, nullable=True)
-
     heartbeats = relationship("Heartbeat", back_populates="machine", cascade="all, delete-orphan")
     agent_token = relationship("AgentToken", back_populates="machine", uselist=False, cascade="all, delete-orphan")
-
-    __table_args__ = (
-        Index("ix_machines_status_last_seen", "status", "last_seen"),
-    )
+    __table_args__ = (Index("ix_machines_status_last_seen", "status", "last_seen"),)
 
 
 class Heartbeat(Base):
     __tablename__ = "heartbeats"
-
     id = Column(BigInteger, primary_key=True, index=True)
     machine_id = Column(Integer, ForeignKey("machines.id", ondelete="CASCADE"), nullable=False, index=True)
     timestamp = Column(DateTime(timezone=True), server_default=text("NOW()"), nullable=False)
@@ -145,9 +113,7 @@ class Heartbeat(Base):
     memory_usage = Column(Float, nullable=True)
     is_idle = Column(Boolean, default=False, nullable=False)
     energy_delta_kwh = Column(Float, default=0.0, nullable=False)
-
     machine = relationship("Machine", back_populates="heartbeats")
-
     __table_args__ = (
         Index("ix_heartbeats_machine_id_timestamp", "machine_id", "timestamp"),
         Index("ix_heartbeats_timestamp", "timestamp"),
@@ -156,19 +122,16 @@ class Heartbeat(Base):
 
 class AgentToken(Base):
     __tablename__ = "agent_tokens"
-
     id = Column(Integer, primary_key=True, index=True)
     machine_id = Column(Integer, ForeignKey("machines.id", ondelete="CASCADE"), unique=True, nullable=False, index=True)
     token_hash = Column(String(256), unique=True, nullable=False)
     issued_at = Column(DateTime(timezone=True), server_default=text("NOW()"), nullable=False)
     last_used = Column(DateTime(timezone=True), nullable=True)
     revoked = Column(Boolean, default=False, nullable=False)
-
     machine = relationship("Machine", back_populates="agent_token")
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """Dependency for getting async DB session."""
     async with AsyncSessionLocal() as session:
         try:
             yield session
@@ -181,12 +144,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def create_tables():
-    """
-    Create all tables if they don't exist. Safe to call on every startup.
-    Uses checkfirst=True so existing types and tables are skipped.
-    """
     async with engine.begin() as conn:
-        # Ensure enum types exist (idempotent - DO $$ BEGIN ... EXCEPTION END $$)
         await conn.execute(text("""
             DO $$ BEGIN
                 CREATE TYPE machine_status AS ENUM ('online', 'idle', 'offline');
@@ -199,5 +157,4 @@ async def create_tables():
             EXCEPTION WHEN duplicate_object THEN null;
             END $$;
         """))
-        # Create tables (skips existing)
         await conn.run_sync(Base.metadata.create_all, checkfirst=True)

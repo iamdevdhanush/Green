@@ -1,29 +1,13 @@
-# GreenOps Server Requirements
-# Python 3.11+
-
-# Web Framework
 fastapi==0.110.0
 uvicorn[standard]==0.27.1
 gunicorn==21.2.0
-
-# ASGI & Middleware
 starlette==0.36.3
-
-# Database
 sqlalchemy==2.0.27
 asyncpg==0.29.0
 alembic==1.13.1
-
-# Authentication & Security
 argon2-cffi==23.1.0
 pyjwt==2.8.0
-
-# Configuration
 pydantic==2.6.1
 pydantic-settings==2.2.1
-
-# Logging
 structlog==24.1.0
-
-# Compression
 brotli==1.1.0

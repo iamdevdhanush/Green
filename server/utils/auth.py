@@ -1,9 +1,4 @@
-"""
-GreenOps Authentication Utilities
-- Argon2id password hashing
-- JWT access + refresh tokens
-- Agent token generation
-"""
+"""GreenOps Authentication Utilities"""
 import hashlib
 import secrets
 import uuid
@@ -20,23 +15,14 @@ from config import get_settings
 logger = structlog.get_logger(__name__)
 settings = get_settings()
 
-# Argon2id password hasher - OWASP recommended parameters
-_ph = PasswordHasher(
-    time_cost=3,        # Number of iterations
-    memory_cost=65536,  # 64 MiB
-    parallelism=4,      # 4 parallel threads
-    hash_len=32,        # 32 byte hash
-    salt_len=16,        # 16 byte salt
-)
+_ph = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=4, hash_len=32, salt_len=16)
 
 
 def hash_password(password: str) -> str:
-    """Hash password using Argon2id."""
     return _ph.hash(password)
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify password against Argon2id hash."""
     try:
         return _ph.verify(hashed_password, plain_password)
     except (VerifyMismatchError, VerificationError, InvalidHashError):
@@ -44,20 +30,12 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 
 def needs_rehash(hashed_password: str) -> bool:
-    """Check if password hash needs upgrading."""
     return _ph.check_needs_rehash(hashed_password)
 
 
-def create_access_token(
-    user_id: int,
-    username: str,
-    role: str,
-    expires_delta: Optional[timedelta] = None,
-) -> Tuple[str, datetime]:
-    """Create JWT access token. Returns (token, expiry)."""
+def create_access_token(user_id: int, username: str, role: str, expires_delta: Optional[timedelta] = None) -> Tuple[str, datetime]:
     if expires_delta is None:
         expires_delta = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-
     expire = datetime.now(timezone.utc) + expires_delta
     payload = {
         "sub": str(user_id),
@@ -73,7 +51,6 @@ def create_access_token(
 
 
 def create_refresh_token() -> Tuple[str, str, datetime]:
-    """Create refresh token. Returns (raw_token, token_hash, expiry)."""
     raw_token = secrets.token_urlsafe(48)
     token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
     expire = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
@@ -81,40 +58,26 @@ def create_refresh_token() -> Tuple[str, str, datetime]:
 
 
 def hash_refresh_token(raw_token: str) -> str:
-    """Hash a refresh token for storage."""
     return hashlib.sha256(raw_token.encode()).hexdigest()
 
 
 def decode_access_token(token: str) -> Optional[dict]:
-    """
-    Decode and validate JWT access token.
-    Returns payload dict or None if invalid.
-    """
     try:
-        payload = jwt.decode(
-            token,
-            settings.JWT_SECRET_KEY,
-            algorithms=[settings.JWT_ALGORITHM],
-            options={"verify_exp": True},
-        )
+        payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM], options={"verify_exp": True})
         if payload.get("type") != "access":
             return None
         return payload
     except jwt.ExpiredSignatureError:
-        logger.debug("token_expired")
         return None
-    except jwt.InvalidTokenError as e:
-        logger.debug("token_invalid", error=str(e))
+    except jwt.InvalidTokenError:
         return None
 
 
 def generate_agent_token() -> Tuple[str, str]:
-    """Generate agent token. Returns (raw_token, token_hash)."""
     raw_token = f"agt_{secrets.token_urlsafe(32)}"
     token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
     return raw_token, token_hash
 
 
 def hash_agent_token(raw_token: str) -> str:
-    """Hash an agent token for storage/lookup."""
     return hashlib.sha256(raw_token.encode()).hexdigest()

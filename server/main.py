@@ -1,7 +1,4 @@
-"""
-GreenOps Server - Production-ready FastAPI application
-Green IT Infrastructure Monitoring Platform
-"""
+"""GreenOps Server - Production-ready FastAPI application"""
 import logging
 import os
 import sys
@@ -9,7 +6,7 @@ import time
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
@@ -21,7 +18,6 @@ from middleware.request_id import RequestIDMiddleware
 from middleware.security_headers import SecurityHeadersMiddleware
 from routers import auth, agents, machines, dashboard
 
-# Configure structured logging
 structlog.configure(
     processors=[
         structlog.contextvars.merge_contextvars,
@@ -43,17 +39,14 @@ logger = structlog.get_logger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan - startup and shutdown."""
     settings = get_settings()
-
-    # Validate required environment variables on startup
     logger.info("greenops_starting", version="2.0.0", environment=settings.ENV)
+
     missing = settings.validate()
     if missing:
         logger.error("missing_required_env_vars", missing=missing)
         sys.exit(1)
 
-    # Initialize database tables
     try:
         await create_tables()
         logger.info("database_initialized")
@@ -61,7 +54,6 @@ async def lifespan(app: FastAPI):
         logger.error("database_init_failed", error=str(e))
         sys.exit(1)
 
-    # Create default admin user if not exists
     from database import AsyncSessionLocal
     from routers.auth import ensure_admin_exists
     async with AsyncSessionLocal() as db:
@@ -88,7 +80,6 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Middleware (order matters - outermost first)
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(RequestIDMiddleware)
     app.add_middleware(GZipMiddleware, minimum_size=1000)
@@ -103,7 +94,6 @@ def create_app() -> FastAPI:
     )
     app.add_middleware(RateLimitMiddleware)
 
-    # Routers
     app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
     app.include_router(agents.router, prefix="/api/agents", tags=["Agents"])
     app.include_router(machines.router, prefix="/api/machines", tags=["Machines"])
@@ -111,7 +101,6 @@ def create_app() -> FastAPI:
 
     @app.get("/health", tags=["Health"])
     async def health_check():
-        """Health check endpoint for load balancers and monitoring."""
         from database import AsyncSessionLocal
         from sqlalchemy import text
         try:
@@ -120,10 +109,8 @@ def create_app() -> FastAPI:
             db_status = "healthy"
         except Exception:
             db_status = "unhealthy"
-
-        status = "healthy" if db_status == "healthy" else "degraded"
         return {
-            "status": status,
+            "status": "healthy" if db_status == "healthy" else "degraded",
             "version": "2.0.0",
             "database": db_status,
             "timestamp": time.time(),
