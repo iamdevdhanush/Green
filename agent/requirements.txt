@@ -1,2 +1,4 @@
-requests>=2.31.0
-psutil>=5.9.0  # optional but recommended for accurate CPU/RAM metrics
+# GreenOps Agent Requirements
+# Core: stdlib only (no external deps required)
+# Optional: psutil for better CPU/memory detection (recommended)
+psutil>=5.9.0

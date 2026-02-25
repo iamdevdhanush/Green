@@ -1,246 +1,284 @@
-# GreenOps — Enterprise Infrastructure Energy Intelligence
+# GreenOps v2.0 — Green IT Infrastructure Monitoring Platform
 
-> Stop wasting energy. Stop wasting money. Know exactly where your CO₂ comes from.
+Production-ready SaaS platform for monitoring organizational computers, tracking idle machines, estimating energy waste, and optimizing infrastructure utilization.
 
-GreenOps is a production-ready SaaS platform that automatically monitors your infrastructure, tracks idle energy waste, calculates real CO₂ emissions and cost impact, and enables secure remote shutdown of idle machines — all in a beautifully designed real-time dashboard.
+## What's New in v2.0
+
+- **Argon2id** password hashing (replaces plain/weak hashing)
+- **Access + Refresh token** JWT system (replaces single insecure token)
+- **Rate limiting** with per-IP brute-force protection (10 login attempts / 5 min)
+- **Account lockout** after repeated failures
+- **Secure agent tokens** (SHA-256 hashed, revocable)
+- **RBAC** (admin/viewer roles)
+- **Input validation** on all endpoints (Pydantic v2)
+- **Security headers** middleware (XSS, CSRF, clickjacking protection)
+- **Structured logging** with request IDs
+- **Production Docker** multi-stage build (non-root, minimal image)
+- **Nginx reverse proxy** with rate limiting, gzip, secure headers
+- **Environment-based config** with startup validation
+- **Health check** endpoint
+- **Cross-platform agent** (Windows 10+, Linux, macOS)
+- **Offline queue** for agent heartbeats
+- **Modern dashboard** with real-time charts
+
+---
+
+## Quick Start (< 5 minutes)
+
+### 1. Configure
+
+```bash
+cp .env.example .env
+# Edit .env — at minimum set these:
+# - POSTGRES_PASSWORD
+# - JWT_SECRET_KEY  (generate: python3 -c "import secrets; print(secrets.token_urlsafe(48))")
+# - INITIAL_ADMIN_PASSWORD
+```
+
+### 2. Start Server
+
+```bash
+docker-compose up -d
+
+# Check status
+docker-compose ps
+
+# View logs
+docker-compose logs -f server
+```
+
+### 3. Open Dashboard
+
+Visit **http://localhost** and sign in with your admin credentials.
+
+### 4. Run Agent
+
+**Windows:**
+```cmd
+cd agent
+pip install -r requirements.txt
+set GREENOPS_SERVER_URL=http://your-server
+python agent.py
+```
+
+Or use the installer (run as Administrator):
+```cmd
+install_windows.bat
+```
+
+**Linux:**
+```bash
+# Quick run
+GREENOPS_SERVER_URL=http://your-server python3 agent/agent.py
+
+# Install as systemd service
+sudo bash agent/install_linux.sh http://your-server
+```
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         GREENOPS PLATFORM                        │
-├──────────────┬──────────────────────────┬────────────────────────┤
-│   Frontend   │         Backend          │       Agents           │
-│              │                          │                        │
-│  React/TS    │   FastAPI (Python)       │  Python daemon on      │
-│  Vite        │   PostgreSQL             │  monitored servers     │
-│  Tailwind    │   Redis (cache/queue)    │                        │
-│  Recharts    │   Celery workers         │  Heartbeat every 60s   │
-│  Framer      │   JWT + RBAC             │  Idle detection        │
-│  WebSocket   │   Prometheus metrics     │  Remote shutdown       │
-│  Port: 5173  │   Port: 8000             │  validation            │
-└──────────────┴──────────────────────────┴────────────────────────┘
-```
+┌─────────────────────────────────────────────────────────────┐
+│                         Browser                             │
+│                    React Dashboard                          │
+└──────────────────────────┬──────────────────────────────────┘
+                           │ HTTPS
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Nginx (Port 80/443)                      │
+│         Rate limiting · Gzip · Secure headers               │
+└──────────────┬────────────────────────┬─────────────────────┘
+               │ /api/*                 │ /
+               ▼                        ▼
+┌──────────────────────┐    ┌──────────────────────────────┐
+│  FastAPI + Gunicorn  │    │  Static files (React build)  │
+│  (Port 8000)         │    │  served directly by Nginx    │
+│  4 Uvicorn workers   │    └──────────────────────────────┘
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  PostgreSQL 16       │
+│  (Internal network)  │
+└──────────────────────┘
 
----
-
-## Quick Start
-
-### Prerequisites
-
-- Python 3.11+
-- Node.js 18+
-- PostgreSQL 14+
-- Redis 7+
-
-### 1. Setup
-
-```bash
-git clone <repo>
-cd greenops
-chmod +x setup.sh
-./setup.sh
-```
-
-### 2. Start Services
-
-**Terminal 1 — API:**
-```bash
-./start-backend.sh
-```
-
-**Terminal 2 — Background Workers:**
-```bash
-./start-celery.sh
-```
-
-**Terminal 3 — Frontend:**
-```bash
-./start-frontend.sh
-```
-
-### 3. First Login
-
-Open `http://localhost:5173`
-
-The **first registered user automatically becomes an Admin**.
-
----
-
-## Environment Variables
-
-See `backend/.env.example` for all configuration options.
-
-Key settings:
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection string | `postgresql://greenops:greenops_dev@localhost:5432/greenops` |
-| `REDIS_URL` | Redis connection string | `redis://localhost:6379/0` |
-| `SECRET_KEY` | JWT signing key (auto-generated) | — |
-| `IDLE_KWH_PER_HOUR` | kWh per idle server hour | `0.12` |
-| `CO2_KG_PER_KWH` | CO₂ intensity factor | `0.386` |
-| `COST_PER_KWH` | Electricity rate USD | `0.12` |
-
----
-
-## Agent Installation
-
-Install the GreenOps Agent on servers you want to monitor:
-
-```bash
-cd agent/
-pip install -r requirements.txt
-
-# Register and run continuously
-python greenops_agent.py --server http://your-greenops-host:8000
-
-# Register only (get API key)
-python greenops_agent.py --server http://your-host:8000 --register-only
-```
-
-### Systemd Service
-
-```bash
-# Install as system service
-sudo cp agent/greenops-agent.service /etc/systemd/system/
-sudo systemctl enable --now greenops-agent
+Agents (Windows/Linux/macOS)
+└── POST /api/agents/register   (get token)
+└── POST /api/agents/heartbeat  (every 60s)
 ```
 
 ---
 
 ## API Reference
 
-Interactive docs at: `http://localhost:8000/api/docs`
-
 ### Authentication
-```
-POST /api/v1/auth/register    Create user account
-POST /api/v1/auth/login       Get JWT tokens
-POST /api/v1/auth/refresh     Refresh access token
-GET  /api/v1/auth/me          Current user
-```
 
-### Agent API (API Key auth via X-API-Key header)
-```
-POST /api/v1/agents/register       Register new machine
-POST /api/v1/agents/heartbeat      Report telemetry
-GET  /api/v1/agents/commands/poll  Check for commands
-POST /api/v1/agents/commands/result Report command execution
-```
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/auth/login` | Login → access + refresh tokens |
+| POST | `/api/auth/refresh` | Refresh access token |
+| POST | `/api/auth/logout` | Revoke refresh token |
+| GET | `/api/auth/verify` | Verify access token |
+| GET | `/api/auth/me` | Get current user info |
 
-### Machines
-```
-GET    /api/v1/machines              List machines (paginated)
-GET    /api/v1/machines/{id}         Machine details
-GET    /api/v1/machines/{id}/history Energy history
-DELETE /api/v1/machines/{id}         Deactivate machine
-```
+### Agents (token auth)
 
-### Analytics
-```
-GET /api/v1/analytics/overview             Platform stats
-GET /api/v1/analytics/energy/timeseries    kWh time series
-GET /api/v1/analytics/co2/trend            CO₂ daily trend
-GET /api/v1/analytics/cost/projection      Cost projection
-GET /api/v1/analytics/monthly              Monthly aggregates
-GET /api/v1/analytics/audit                Audit log
-```
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/agents/register` | Register/re-register machine |
+| POST | `/api/agents/heartbeat` | Submit heartbeat |
+| GET | `/api/agents/health` | Agent connectivity check |
 
-### Commands (Admin only)
-```
-POST /api/v1/commands/shutdown     Issue shutdown command
-GET  /api/v1/commands/shutdown/{id} List machine commands
+### Machines (JWT auth)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/machines` | List machines (filterable) |
+| GET | `/api/machines/{id}` | Machine details |
+| PATCH | `/api/machines/{id}` | Update machine |
+| DELETE | `/api/machines/{id}` | Delete machine |
+| GET | `/api/machines/{id}/heartbeats` | Heartbeat history |
+| POST | `/api/machines/{id}/revoke-token` | Revoke agent token |
+
+### Dashboard (JWT auth)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/dashboard/stats` | Aggregate statistics |
+| GET | `/api/dashboard/energy-trend?days=7` | Energy trend |
+| GET | `/api/dashboard/top-idle` | Top idle machines |
+| GET | `/api/dashboard/recent-activity` | Recent heartbeats |
+
+---
+
+## Security
+
+### Password Hashing
+- Algorithm: **Argon2id** (OWASP recommended)
+- Parameters: time_cost=3, memory_cost=64MiB, parallelism=4
+- Automatic rehash on login if parameters are upgraded
+
+### Token Security
+- **Access tokens**: JWT HS256, 60-minute expiry
+- **Refresh tokens**: random 48-byte URL-safe token, SHA-256 hashed, 30-day expiry, rotated on use
+- **Agent tokens**: `agt_` prefixed, SHA-256 hashed, revocable
+
+### Brute Force Protection
+- 10 failed logins → account locked for 15 minutes
+- Rate limit: 10 login requests / 5 minutes per IP
+- General API: 100 requests / 60 seconds per IP
+
+### Production Checklist
+
+- [ ] Strong `POSTGRES_PASSWORD` (min 20 chars)
+- [ ] Strong `JWT_SECRET_KEY` (min 48 chars, generated randomly)
+- [ ] Strong `INITIAL_ADMIN_PASSWORD` (min 12 chars)
+- [ ] Change default admin password after first login
+- [ ] Set correct `CORS_ORIGINS` for your domain
+- [ ] Enable HTTPS (uncomment nginx SSL config)
+- [ ] Set up database backups
+- [ ] Configure log rotation
+- [ ] Enable firewall (only expose ports 80/443)
+- [ ] Set `ENV=production`
+- [ ] Set `DEBUG=false`
+
+---
+
+## Agent Configuration
+
+Priority order: environment variables > config file > defaults
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GREENOPS_SERVER_URL` | `http://localhost:8000` | Server URL |
+| `GREENOPS_HEARTBEAT_INTERVAL` | `60` | Seconds between heartbeats |
+| `GREENOPS_IDLE_THRESHOLD` | `300` | Seconds of inactivity = idle |
+| `GREENOPS_LOG_LEVEL` | `INFO` | Log verbosity |
+| `GREENOPS_AGENT_TOKEN` | — | Persist token across restarts |
+| `GREENOPS_MACHINE_ID` | — | Persist machine ID |
+
+### Config File
+
+- **Windows**: `C:\ProgramData\GreenOps\config.json`
+- **Linux/macOS**: `~/.greenops/config.json`
+
+```json
+{
+  "server_url": "http://your-server",
+  "heartbeat_interval": 60,
+  "idle_threshold": 300,
+  "log_level": "INFO"
+}
 ```
 
 ---
 
-## Security Features
+## Operations
 
-| Feature | Implementation |
-|---------|---------------|
-| Password hashing | bcrypt (cost factor 12) |
-| JWT tokens | Access (30m) + Refresh (7d) |
-| API keys | `grn_` prefixed, 48-char random |
-| RBAC | Admin / Manager / Viewer roles |
-| Rate limiting | slowapi + Redis |
-| MAC uniqueness | DB unique constraint |
-| Shutdown auth | Idle re-validation on agent |
-| Command TTL | 2-minute auto-expiry |
-| Audit trail | Every action logged |
-| SQL injection | SQLAlchemy ORM (parameterized) |
-| CORS | Configured allowlist |
+### Backups
+```bash
+# Create backup
+docker exec greenops-db pg_dump -U greenops greenops | gzip > backup_$(date +%Y%m%d).sql.gz
 
----
-
-## Folder Structure
-
+# Restore
+docker exec -i greenops-db psql -U greenops greenops < backup.sql
 ```
-greenops/
-├── backend/
-│   ├── app/
-│   │   ├── api/v1/endpoints/   # Route handlers
-│   │   ├── core/               # Config, DB, security, Redis
-│   │   ├── models/             # SQLAlchemy models
-│   │   ├── schemas/            # Pydantic schemas
-│   │   ├── services/           # Business logic
-│   │   ├── workers/            # Celery tasks
-│   │   ├── middleware/         # Rate limiting
-│   │   └── main.py             # FastAPI app entry
-│   ├── alembic/                # DB migrations
-│   └── requirements.txt
-│
-├── frontend/
-│   └── src/
-│       ├── components/         # Reusable UI & layout
-│       ├── pages/              # Route pages
-│       ├── services/           # Axios API client
-│       ├── store/              # Zustand state
-│       └── types/              # TypeScript types
-│
-├── agent/
-│   ├── greenops_agent.py       # Agent daemon
-│   └── greenops-agent.service  # systemd unit
-│
-└── setup.sh                    # One-command setup
+
+### Logs
+```bash
+# All services
+docker-compose logs -f
+
+# Server only
+docker-compose logs -f server
+
+# Agent (Linux systemd)
+journalctl -u greenops-agent -f
+
+# Agent (Windows)
+type C:\ProgramData\GreenOps\agent.log
+```
+
+### Scaling
+```bash
+# Scale API workers (horizontal)
+docker-compose up -d --scale server=3
 ```
 
 ---
 
-## Energy Calculations
+## Development
 
+```bash
+# Backend
+cd server
+pip install -r ../requirements.txt
+uvicorn main:app --reload --port 8000
+
+# Frontend
+cd dashboard
+npm install
+npm start  # http://localhost:3000
 ```
-idle_hours    = idle_minutes / 60
-energy_kwh    = idle_hours × 0.12 kWh/hr
-co2_kg        = energy_kwh × 0.386 kg/kWh (US grid average)
-cost_usd      = energy_kwh × $0.12/kWh
-```
-
-All constants are configurable via environment variables.
 
 ---
 
-## Background Workers
+## System Requirements
 
-Celery Beat runs two periodic tasks:
-
-| Task | Schedule | Purpose |
-|------|----------|---------|
-| `aggregate_monthly_task` | 1st of month, 00:05 UTC | Aggregate metrics into `monthly_analytics` |
-| `mark_offline_machines_task` | Every 5 minutes | Mark machines with no heartbeat > 5m as offline |
-
----
-
-## Prometheus Metrics
-
-Available at `GET /metrics` in Prometheus format. Includes:
-- HTTP request duration histograms
-- Request counts by endpoint and status
-- In-progress requests
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| Server CPU | 2 cores | 4+ cores |
+| Server RAM | 2 GB | 4+ GB |
+| Server Disk | 20 GB | 50+ GB |
+| Server OS | Linux (Docker) | Ubuntu 22.04 LTS |
+| Agent Python | 3.9+ | 3.11+ |
+| Agent OS | Windows 10, Linux kernel 4.x | Windows 11, Ubuntu 22.04 |
+| Agent RAM | 30 MB | — |
 
 ---
 
-## License
-
-Proprietary — GreenOps Enterprise Edition
+*Built for reliability. Designed for scale. Ready for production.*

@@ -1,0 +1,150 @@
+"""
+GreenOps Server - Production-ready FastAPI application
+Green IT Infrastructure Monitoring Platform
+"""
+import logging
+import os
+import sys
+import time
+from contextlib import asynccontextmanager
+
+import structlog
+from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
+
+from config import get_settings
+from database import create_tables, engine
+from middleware.rate_limiter import RateLimitMiddleware
+from middleware.request_id import RequestIDMiddleware
+from middleware.security_headers import SecurityHeadersMiddleware
+from routers import auth, agents, machines, dashboard
+
+# Configure structured logging
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        structlog.processors.JSONRenderer() if os.getenv("ENV", "development") == "production"
+        else structlog.dev.ConsoleRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+    context_class=dict,
+    logger_factory=structlog.PrintLoggerFactory(),
+    cache_logger_on_first_use=True,
+)
+
+logger = structlog.get_logger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan - startup and shutdown."""
+    settings = get_settings()
+
+    # Validate required environment variables on startup
+    logger.info("greenops_starting", version="2.0.0", environment=settings.ENV)
+    missing = settings.validate()
+    if missing:
+        logger.error("missing_required_env_vars", missing=missing)
+        sys.exit(1)
+
+    # Initialize database tables
+    try:
+        await create_tables()
+        logger.info("database_initialized")
+    except Exception as e:
+        logger.error("database_init_failed", error=str(e))
+        sys.exit(1)
+
+    # Create default admin user if not exists
+    from database import AsyncSessionLocal
+    from routers.auth import ensure_admin_exists
+    async with AsyncSessionLocal() as db:
+        await ensure_admin_exists(db)
+
+    logger.info("greenops_ready", host="0.0.0.0", port=8000)
+    yield
+
+    logger.info("greenops_shutting_down")
+    await engine.dispose()
+    logger.info("greenops_stopped")
+
+
+def create_app() -> FastAPI:
+    settings = get_settings()
+
+    app = FastAPI(
+        title="GreenOps API",
+        description="Green IT Infrastructure Monitoring Platform",
+        version="2.0.0",
+        docs_url="/api/docs" if settings.ENV != "production" else None,
+        redoc_url="/api/redoc" if settings.ENV != "production" else None,
+        openapi_url="/api/openapi.json" if settings.ENV != "production" else None,
+        lifespan=lifespan,
+    )
+
+    # Middleware (order matters - outermost first)
+    app.add_middleware(SecurityHeadersMiddleware)
+    app.add_middleware(RequestIDMiddleware)
+    app.add_middleware(GZipMiddleware, minimum_size=1000)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins_list,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+        expose_headers=["X-Request-ID"],
+        max_age=600,
+    )
+    app.add_middleware(RateLimitMiddleware)
+
+    # Routers
+    app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
+    app.include_router(agents.router, prefix="/api/agents", tags=["Agents"])
+    app.include_router(machines.router, prefix="/api/machines", tags=["Machines"])
+    app.include_router(dashboard.router, prefix="/api/dashboard", tags=["Dashboard"])
+
+    @app.get("/health", tags=["Health"])
+    async def health_check():
+        """Health check endpoint for load balancers and monitoring."""
+        from database import AsyncSessionLocal
+        from sqlalchemy import text
+        try:
+            async with AsyncSessionLocal() as db:
+                await db.execute(text("SELECT 1"))
+            db_status = "healthy"
+        except Exception:
+            db_status = "unhealthy"
+
+        status = "healthy" if db_status == "healthy" else "degraded"
+        return {
+            "status": status,
+            "version": "2.0.0",
+            "database": db_status,
+            "timestamp": time.time(),
+        }
+
+    @app.exception_handler(404)
+    async def not_found_handler(request: Request, exc):
+        return JSONResponse(
+            status_code=404,
+            content={"error": "not_found", "message": "The requested resource was not found."},
+        )
+
+    @app.exception_handler(500)
+    async def internal_error_handler(request: Request, exc):
+        logger.error("unhandled_exception", path=request.url.path, error=str(exc))
+        return JSONResponse(
+            status_code=500,
+            content={"error": "internal_server_error", "message": "An unexpected error occurred."},
+        )
+
+    return app
+
+
+app = create_app()

@@ -1,0 +1,51 @@
+# GreenOps .gitignore
+
+# Environment
+.env
+.env.local
+.env.production
+*.secret
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+dashboard/build/
+dashboard/.env.local
+npm-debug.log*
+yarn-error.log
+
+# Logs
+*.log
+logs/
+
+# Database
+*.db
+*.sqlite3
+
+# Docker
+.docker/
+
+# SSL certs
+nginx/certs/*.pem
+nginx/certs/*.crt
+nginx/certs/*.key
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
