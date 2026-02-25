@@ -61,13 +61,26 @@ class UserRole(str, enum.Enum):
     VIEWER = "viewer"
 
 
+# Explicit PostgreSQL type names — MUST match migration SQL exactly
+_machine_status_pg = Enum(
+    MachineStatus,
+    name="machine_status",
+    create_type=False,   # already created by migration SQL
+)
+_user_role_pg = Enum(
+    UserRole,
+    name="user_role",
+    create_type=False,   # already created by migration SQL
+)
+
+
 class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(64), unique=True, nullable=False, index=True)
     password_hash = Column(String(256), nullable=False)
-    role = Column(Enum(UserRole), default=UserRole.ADMIN, nullable=False)
+    role = Column(_user_role_pg, default=UserRole.ADMIN, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
     failed_login_attempts = Column(Integer, default=0, nullable=False)
     locked_until = Column(DateTime(timezone=True), nullable=True)
@@ -103,7 +116,7 @@ class Machine(Base):
     os_type = Column(String(64), nullable=False)
     os_version = Column(String(128), nullable=True)
     ip_address = Column(String(64), nullable=True)
-    status = Column(Enum(MachineStatus), default=MachineStatus.OFFLINE, nullable=False, index=True)
+    status = Column(_machine_status_pg, default=MachineStatus.OFFLINE, nullable=False, index=True)
     first_seen = Column(DateTime(timezone=True), server_default=text("NOW()"), nullable=False)
     last_seen = Column(DateTime(timezone=True), server_default=text("NOW()"), nullable=False)
     total_idle_seconds = Column(BigInteger, default=0, nullable=False)
@@ -168,6 +181,23 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def create_tables():
-    """Create all tables if they don't exist."""
+    """
+    Create all tables if they don't exist. Safe to call on every startup.
+    Uses checkfirst=True so existing types and tables are skipped.
+    """
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+        # Ensure enum types exist (idempotent - DO $$ BEGIN ... EXCEPTION END $$)
+        await conn.execute(text("""
+            DO $$ BEGIN
+                CREATE TYPE machine_status AS ENUM ('online', 'idle', 'offline');
+            EXCEPTION WHEN duplicate_object THEN null;
+            END $$;
+        """))
+        await conn.execute(text("""
+            DO $$ BEGIN
+                CREATE TYPE user_role AS ENUM ('admin', 'viewer');
+            EXCEPTION WHEN duplicate_object THEN null;
+            END $$;
+        """))
+        # Create tables (skips existing)
+        await conn.run_sync(Base.metadata.create_all, checkfirst=True)
