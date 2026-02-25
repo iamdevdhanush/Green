@@ -5,13 +5,15 @@ GreenOps Authentication Router
 - Logout / revoke tokens
 - Token verification
 """
-from datetime import datetime, timezone
+
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select, update
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import RefreshToken, User, UserRole, get_db
@@ -23,7 +25,7 @@ from utils.auth import (
     needs_rehash,
     verify_password,
 )
-from utils.security import bearer_scheme, get_current_user
+from utils.security import get_current_user
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -31,6 +33,10 @@ router = APIRouter()
 ACCOUNT_LOCKOUT_THRESHOLD = 10
 ACCOUNT_LOCKOUT_MINUTES = 15
 
+
+# ============================
+# Request / Response Models
+# ============================
 
 class LoginRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=64)
@@ -61,75 +67,78 @@ class TokenResponse(BaseModel):
     expires_at: datetime
 
 
+# ============================
+# Login
+# ============================
+
 @router.post("/login", response_model=LoginResponse)
 async def login(
     payload: LoginRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Login and receive access + refresh tokens."""
     ip_address = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or (
         request.client.host if request.client else "unknown"
     )
 
-    # Fetch user
-    result = await db.execute(select(User).where(User.username == payload.username))
+    result = await db.execute(
+        select(User).where(User.username == payload.username)
+    )
     user = result.scalar_one_or_none()
 
-    # Use constant-time comparison to prevent timing attacks
     if not user or not user.is_active:
-        # Still run hash check to prevent user enumeration timing
-        verify_password("dummy_password", "$argon2id$v=19$m=65536,t=3,p=4$dummy$dummy")
+        verify_password("dummy", "$argon2id$v=19$m=65536,t=3,p=4$dummy$dummy")
         logger.warning("login_failed_user_not_found", username=payload.username, ip=ip_address)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"error": "invalid_credentials", "message": "Invalid username or password."},
         )
 
-    # Check account lockout
     if user.locked_until and user.locked_until > datetime.now(timezone.utc):
-        wait_minutes = int((user.locked_until - datetime.now(timezone.utc)).total_seconds() / 60) + 1
+        wait_minutes = int(
+            (user.locked_until - datetime.now(timezone.utc)).total_seconds() / 60
+        ) + 1
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail={
                 "error": "account_locked",
-                "message": f"Account locked due to too many failed attempts. Try again in {wait_minutes} minutes.",
+                "message": f"Account locked. Try again in {wait_minutes} minutes.",
             },
         )
 
-    # Verify password
     if not verify_password(payload.password, user.password_hash):
         user.failed_login_attempts += 1
+
         if user.failed_login_attempts >= ACCOUNT_LOCKOUT_THRESHOLD:
-            from datetime import timedelta
-            user.locked_until = datetime.now(timezone.utc) + timedelta(minutes=ACCOUNT_LOCKOUT_MINUTES)
+            user.locked_until = datetime.now(timezone.utc) + timedelta(
+                minutes=ACCOUNT_LOCKOUT_MINUTES
+            )
             user.failed_login_attempts = 0
             logger.warning("account_locked", username=payload.username, ip=ip_address)
+
         await db.commit()
-        logger.warning("login_failed_bad_password", username=payload.username, ip=ip_address)
+
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"error": "invalid_credentials", "message": "Invalid username or password."},
         )
 
-    # Reset failed attempts on success
+    # Successful login
     user.failed_login_attempts = 0
     user.locked_until = None
     user.last_login = datetime.now(timezone.utc)
 
-    # Rehash password if needed (algorithm upgrade)
     if needs_rehash(user.password_hash):
         user.password_hash = hash_password(payload.password)
 
-    # Generate tokens
     access_token, expires_at = create_access_token(
         user_id=user.id,
         username=user.username,
         role=user.role.value,
     )
+
     raw_refresh, refresh_hash, refresh_expires = create_refresh_token()
 
-    # Store refresh token
     db_refresh = RefreshToken(
         user_id=user.id,
         token_hash=refresh_hash,
@@ -137,6 +146,7 @@ async def login(
         user_agent=request.headers.get("User-Agent", "")[:256],
         ip_address=ip_address[:64],
     )
+
     db.add(db_refresh)
     await db.commit()
 
@@ -151,13 +161,15 @@ async def login(
     )
 
 
+# ============================
+# Refresh
+# ============================
+
 @router.post("/refresh", response_model=TokenResponse)
 async def refresh_token(
     payload: RefreshRequest,
-    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Exchange refresh token for new access token (with token rotation)."""
     token_hash = hash_refresh_token(payload.refresh_token)
 
     result = await db.execute(
@@ -171,7 +183,7 @@ async def refresh_token(
     if not db_token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": "invalid_token", "message": "Refresh token is invalid or expired."},
+            detail={"error": "invalid_token", "message": "Invalid or expired refresh token."},
         )
 
     if db_token.expires_at < datetime.now(timezone.utc):
@@ -180,32 +192,40 @@ async def refresh_token(
         await db.commit()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": "token_expired", "message": "Refresh token has expired."},
+            detail={"error": "token_expired", "message": "Refresh token expired."},
         )
 
-    # Get user
-    result = await db.execute(select(User).where(User.id == db_token.user_id, User.is_active == True))
+    result = await db.execute(
+        select(User).where(
+            User.id == db_token.user_id,
+            User.is_active == True,
+        )
+    )
     user = result.scalar_one_or_none()
+
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": "user_inactive", "message": "User account is inactive."},
+            detail={"error": "user_inactive", "message": "User inactive."},
         )
 
-    # Revoke old refresh token (rotation)
     db_token.revoked = True
     db_token.revoked_at = datetime.now(timezone.utc)
 
-    # Issue new access token
     access_token, expires_at = create_access_token(
         user_id=user.id,
         username=user.username,
         role=user.role.value,
     )
+
     await db.commit()
 
     return TokenResponse(access_token=access_token, expires_at=expires_at)
 
+
+# ============================
+# Logout
+# ============================
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(
@@ -213,8 +233,8 @@ async def logout(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Revoke refresh token on logout."""
     token_hash = hash_refresh_token(payload.refresh_token)
+
     result = await db.execute(
         select(RefreshToken).where(
             RefreshToken.token_hash == token_hash,
@@ -222,47 +242,30 @@ async def logout(
         )
     )
     db_token = result.scalar_one_or_none()
+
     if db_token:
         db_token.revoked = True
         db_token.revoked_at = datetime.now(timezone.utc)
         await db.commit()
+
     logger.info("logout", username=current_user.username)
 
 
-@router.get("/verify")
-async def verify_token(current_user: User = Depends(get_current_user)):
-    """Verify JWT token and return user info."""
-    return {
-        "valid": True,
-        "user_id": current_user.id,
-        "username": current_user.username,
-        "role": current_user.role.value,
-    }
-
-
-@router.get("/me")
-async def get_me(current_user: User = Depends(get_current_user)):
-    """Get current user profile."""
-    return {
-        "id": current_user.id,
-        "username": current_user.username,
-        "role": current_user.role.value,
-        "last_login": current_user.last_login,
-        "created_at": current_user.created_at,
-    }
-
+# ============================
+# Admin Bootstrap (Race Safe)
+# ============================
 
 async def ensure_admin_exists(db: AsyncSession):
-    """Create initial admin user if no users exist."""
     from config import get_settings
     settings = get_settings()
 
-    result = await db.execute(select(User))
-    existing = result.scalars().first()
+    result = await db.execute(
+        select(User).where(User.username == settings.INITIAL_ADMIN_USERNAME)
+    )
+    existing = result.scalar_one_or_none()
     if existing:
         return
 
-    # Get password from environment
     admin_password = settings.INITIAL_ADMIN_PASSWORD
     if not admin_password:
         import secrets
@@ -270,15 +273,19 @@ async def ensure_admin_exists(db: AsyncSession):
         logger.warning(
             "generated_admin_password",
             password=admin_password,
-            message="SAVE THIS PASSWORD - it will not be shown again. Set INITIAL_ADMIN_PASSWORD env var.",
         )
 
     admin = User(
         username=settings.INITIAL_ADMIN_USERNAME,
         password_hash=hash_password(admin_password),
-        role=UserRole.ADMIN,
+        role=UserRole.ADMIN.value,
         is_active=True,
     )
-    db.add(admin)
-    await db.commit()
-    logger.info("admin_user_created", username=settings.INITIAL_ADMIN_USERNAME)
+
+    try:
+        db.add(admin)
+        await db.commit()
+        logger.info("admin_user_created", username=settings.INITIAL_ADMIN_USERNAME)
+    except IntegrityError:
+        await db.rollback()
+        logger.info("admin_already_exists", username=settings.INITIAL_ADMIN_USERNAME)

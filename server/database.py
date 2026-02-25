@@ -56,7 +56,7 @@ class MachineStatus(str, enum.Enum):
     OFFLINE = "offline"
 
 
-class UserRole(str, enum.Enum):
+class UserRole(enum.Enum):
     ADMIN = "admin"
     VIEWER = "viewer"
 
