@@ -22,7 +22,6 @@ the schema is present — it does not modify it.
 """
 
 import enum
-from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 import structlog
@@ -40,6 +39,7 @@ from sqlalchemy import (
     Text,
     text,
 )
+from sqlalchemy.dialects.postgresql import ENUM as PgEnum
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -131,6 +131,36 @@ class UserRole(str, enum.Enum):
 
 
 # ---------------------------------------------------------------------------
+# PostgreSQL-native ENUM column types
+#
+# WHY: asyncpg sends Python enum members as VARCHAR by default, which
+# PostgreSQL rejects with:
+#   DatatypeMismatchError: column "role" is of type user_role but
+#   expression is of type character varying
+#
+# create_type=False  — type already exists in DB (created by migrations).
+#                      The app must NEVER try to CREATE TYPE.
+# values_callable    — sends "admin" not "ADMIN". PostgreSQL's user_role
+#                      enum contains lowercase values; sending uppercase
+#                      causes: invalid input value for enum user_role: "ADMIN"
+# ---------------------------------------------------------------------------
+
+_user_role_pg = PgEnum(
+    UserRole,
+    name="user_role",           # must match the type name in the migration SQL
+    create_type=False,          # type is created by migrations, not SQLAlchemy
+    values_callable=lambda x: [e.value for e in x],  # sends "admin" not "ADMIN"
+)
+
+_machine_status_pg = PgEnum(
+    MachineStatus,
+    name="machine_status",
+    create_type=False,
+    values_callable=lambda x: [e.value for e in x],
+)
+
+
+# ---------------------------------------------------------------------------
 # ORM Models
 # ---------------------------------------------------------------------------
 
@@ -140,7 +170,7 @@ class User(Base):
     id                    = Column(Integer, primary_key=True, index=True)
     username              = Column(String(64), unique=True, nullable=False, index=True)
     password_hash         = Column(String(256), nullable=False)
-    role                  = Column(String(32), nullable=False, default="admin")
+    role                  = Column(_user_role_pg, nullable=False, default=UserRole.ADMIN)
     is_active             = Column(Boolean, nullable=False, default=True)
     failed_login_attempts = Column(Integer, nullable=False, default=0)
     locked_until          = Column(DateTime(timezone=True), nullable=True)
@@ -181,7 +211,8 @@ class Machine(Base):
     os_type              = Column(String(64), nullable=False)
     os_version           = Column(String(128), nullable=True)
     ip_address           = Column(String(64), nullable=True)
-    status               = Column(String(32), nullable=False, default="offline")
+    status               = Column(_machine_status_pg, nullable=False,
+                                  default=MachineStatus.OFFLINE)
     first_seen           = Column(DateTime(timezone=True), nullable=False,
                                   server_default=text("NOW()"))
     last_seen            = Column(DateTime(timezone=True), nullable=False,
@@ -252,12 +283,6 @@ async def verify_schema() -> None:
     This function does NOT create any tables, types, functions, or triggers.
     All DDL is managed by migrations/init-scripts/ which run in the
     dedicated 'migrate' service before the app container starts.
-
-    Why no DDL here:
-      Multiple Gunicorn workers call this function concurrently at startup.
-      Even IF-NOT-EXISTS DDL acquires heavy locks on pg_class/pg_type, and
-      DROP TRIGGER + CREATE TRIGGER in particular causes deadlocks between
-      workers competing for the same system catalog entries.
     """
     required_tables = ["users", "machines", "heartbeats", "agent_tokens", "refresh_tokens"]
 

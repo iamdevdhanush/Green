@@ -1,25 +1,30 @@
 ##############################################################################
 # GreenOps — Dockerfile.nginx
 #
-# Removes the default nginx conf (which conflicts with our custom conf)
-# and copies our nginx.conf + conf.d/ into the image.
+# IMPORTANT: nginx/conf.d/default.conf must NOT exist alongside greenops.conf
+# because both define a server{} on port 80, causing nginx to fail with:
+#   nginx: [emerg] duplicate listen options for 0.0.0.0:80
 #
-# NOTE: We do NOT run `nginx -t` at build time because the upstream hostnames
-# (server:8000, dashboard:3000) are Docker network aliases that only exist
-# when all containers are running. Build-time validation would always fail
-# with "host not found in upstream". Config correctness is verified at
-# container startup when the network is available.
+# The Dockerfile.nginx already runs `rm -f /etc/nginx/conf.d/default.conf`
+# to remove the nginx image's built-in default, but docker-compose.yml
+# volume-mounts ./nginx/conf.d/ at runtime, which re-introduces our repo's
+# default.conf. Fix: delete default.conf from the repo's conf.d/ directory.
+# This Dockerfile additionally removes it after COPY as a safety net.
 ##############################################################################
 
 FROM nginx:1.25-alpine
 
 # Remove the default config that ships with the nginx image.
-# It defines a server {} on port 80 that would conflict with greenops.conf.
+# It defines a server{} on port 80 that conflicts with greenops.conf.
 RUN rm -f /etc/nginx/conf.d/default.conf
 
 # Copy our nginx configuration
 COPY nginx/nginx.conf      /etc/nginx/nginx.conf
 COPY nginx/conf.d/         /etc/nginx/conf.d/
+
+# Safety net: remove default.conf even if it was accidentally included
+# in the nginx/conf.d/ COPY above.
+RUN rm -f /etc/nginx/conf.d/default.conf
 
 # Cert directory (empty on first run; mounted as volume in compose)
 RUN mkdir -p /etc/nginx/certs
