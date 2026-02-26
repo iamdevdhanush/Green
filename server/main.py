@@ -2,17 +2,25 @@
 GreenOps Server — Production-ready FastAPI application
 
 Startup sequence (lifespan):
-  1. Validate required environment variables (fail fast on config errors)
-  2. Wait for PostgreSQL with exponential backoff (survive transient DB delays)
-  3. Create tables / verify schema
+  1. Validate required environment variables (raises on config errors)
+  2. Wait for PostgreSQL with exponential backoff
+  3. Verify schema is present (does NOT create DDL — see database.py)
   4. Bootstrap admin user (idempotent, multi-worker-safe via pg_advisory_xact_lock)
   5. Yield (application serves requests)
   6. Shutdown: dispose engine, flush logs
+
+Gunicorn worker failure policy:
+  - sys.exit() is NEVER called inside lifespan. It kills the master process
+    and takes down all workers. Instead, exceptions propagate normally and
+    Gunicorn handles individual worker failures with its restart policy.
+  - Configuration errors (missing JWT_SECRET_KEY) raise ValueError.
+  - DB connectivity failures raise RuntimeError.
+  - Schema missing raises RuntimeError.
+  - Gunicorn will restart failed workers up to worker_max_restarts times.
 """
 import asyncio
 import logging
 import os
-import sys
 import time
 from contextlib import asynccontextmanager
 
@@ -23,7 +31,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
 from config import get_settings
-from database import create_tables, engine
+from database import verify_schema, engine
 from middleware.rate_limiter import RateLimitMiddleware
 from middleware.request_id import RequestIDMiddleware
 from middleware.security_headers import SecurityHeadersMiddleware
@@ -53,19 +61,15 @@ logger = structlog.get_logger(__name__)
 # ── DB connection retry ───────────────────────────────────────────────────────
 
 async def _wait_for_database(
-    max_attempts: int = 10,
+    max_attempts: int = 15,
     base_delay: float = 2.0,
     max_delay: float = 60.0,
-) -> bool:
+) -> None:
     """
     Wait for PostgreSQL to accept connections, with exponential backoff.
 
-    Returns True if the connection succeeded within max_attempts.
-    Returns False if all attempts are exhausted (caller should sys.exit).
-
-    This replaces the previous behaviour of crashing immediately on any DB error.
-    Transient failures (DB still starting, brief network blip, container restart
-    race) are retried gracefully. Only true connection exhaustion is fatal.
+    Raises RuntimeError if all attempts are exhausted.
+    Does NOT call sys.exit() — lets Gunicorn handle the worker failure.
 
     Backoff schedule (base_delay=2, max_delay=60):
       Attempt 1: immediate
@@ -78,29 +82,20 @@ async def _wait_for_database(
     """
     from sqlalchemy import text as sql_text
 
+    last_error: Exception | None = None
+
     for attempt in range(1, max_attempts + 1):
         try:
             async with engine.connect() as conn:
                 await conn.execute(sql_text("SELECT 1"))
             logger.info("database_connected", attempt=attempt)
-            return True
+            return
 
         except Exception as exc:
+            last_error = exc
             if attempt >= max_attempts:
-                logger.error(
-                    "database_connection_exhausted",
-                    attempts=max_attempts,
-                    error=str(exc),
-                    hint=(
-                        "Check that POSTGRES_PASSWORD in .env matches the credentials "
-                        "used when the postgres_data volume was first created. "
-                        "If you changed the password, run 'docker compose up' again — "
-                        "the db-setup service will sync the credentials automatically."
-                    ),
-                )
-                return False
+                break
 
-            # Exponential backoff capped at max_delay
             delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
             logger.warning(
                 "database_not_ready",
@@ -111,7 +106,11 @@ async def _wait_for_database(
             )
             await asyncio.sleep(delay)
 
-    return False  # Should be unreachable, but satisfies the type checker.
+    raise RuntimeError(
+        f"Could not connect to PostgreSQL after {max_attempts} attempts. "
+        f"Last error: {last_error}. "
+        "Verify DATABASE_URL, POSTGRES_PASSWORD, and that the db service is healthy."
+    )
 
 
 # ── ASGI lifespan ─────────────────────────────────────────────────────────────
@@ -121,6 +120,12 @@ async def lifespan(app: FastAPI):
     """
     ASGI lifespan handler. Runs startup logic before the first request
     and cleanup logic after the last.
+
+    Error handling policy
+    ─────────────────────
+    Exceptions raised here propagate to Gunicorn, which marks the worker as
+    failed and restarts it (up to max_requests / worker_max_restarts limits).
+    We NEVER call sys.exit() — that would kill the master process.
 
     Gunicorn multi-worker note
     ─────────────────────────
@@ -132,50 +137,36 @@ async def lifespan(app: FastAPI):
     logger.info("greenops_starting", version="2.0.0", environment=settings.ENV)
 
     # ── 1. Validate configuration ─────────────────────────────────────────
-    # sys.exit here is intentional: config errors are not transient.
-    # A misconfigured server is worse than a server that won't start.
-    missing = settings.validate()
-    if missing:
-        for issue in missing:
+    # Raises ValueError on hard config errors. Let it propagate so the
+    # container exits with a non-zero code and a clear error message.
+    issues = settings.validate()
+    if issues:
+        for issue in issues:
             logger.error("config_validation_failed", issue=issue)
-        logger.error(
-            "startup_aborted",
-            reason="Fix the configuration issues above, then restart.",
+        raise ValueError(
+            f"Configuration errors prevent startup: {'; '.join(issues)}. "
+            "Fix the issues in .env and restart."
         )
-        sys.exit(1)
 
-    # ── 2. Wait for database (retry with backoff) ─────────────────────────
-    # Does NOT sys.exit immediately — gives PostgreSQL time to finish starting.
-    # The db-setup service in docker-compose runs before the server starts,
-    # but asyncpg connections may still briefly fail during Gunicorn worker spawn.
-    db_ready = await _wait_for_database(max_attempts=10, base_delay=2.0)
-    if not db_ready:
-        logger.error(
-            "startup_aborted",
-            reason=(
-                "Could not connect to PostgreSQL after 10 attempts. "
-                "Verify DATABASE_URL, POSTGRES_PASSWORD, and that the db service is healthy."
-            ),
-        )
-        sys.exit(1)
+    # ── 2. Wait for database ──────────────────────────────────────────────
+    # Raises RuntimeError if DB is unreachable after all retries.
+    await _wait_for_database(max_attempts=15, base_delay=2.0)
 
-    # ── 3. Initialize database schema ────────────────────────────────────
-    # create_tables() is idempotent (CREATE IF NOT EXISTS).
-    # The migration SQL in init-scripts/ handles first boot; this is a safety net.
+    # ── 3. Verify schema ──────────────────────────────────────────────────
+    # Raises RuntimeError if required tables are missing.
+    # Does NOT run any DDL — see database.py for rationale.
     try:
-        await create_tables()
-        logger.info("database_schema_ready")
-    except Exception as exc:
+        await verify_schema()
+    except RuntimeError as exc:
         logger.error(
-            "database_schema_init_failed",
+            "schema_verification_failed",
             error=str(exc),
             hint=(
-                "This usually means the database is reachable but the schema "
-                "could not be created. Check for enum type mismatches or migration "
-                "failures in the PostgreSQL logs."
+                "Run migrations before starting the app: "
+                "docker compose run --rm migrate"
             ),
         )
-        sys.exit(1)
+        raise
 
     # ── 4. Bootstrap admin user ──────────────────────────────────────────
     # Uses pg_advisory_xact_lock to serialize across multiple workers.
@@ -195,7 +186,7 @@ async def lifespan(app: FastAPI):
                 "missing migrations, or incorrect INITIAL_ADMIN_PASSWORD."
             ),
         )
-        sys.exit(1)
+        raise
 
     logger.info("greenops_ready", host="0.0.0.0", port=8000, environment=settings.ENV)
 

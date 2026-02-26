@@ -1,9 +1,12 @@
 -- =============================================================================
--- GreenOps — migrations/init-scripts/01-initial-schema.sql
+-- GreenOps — migrations/001_initial_schema.sql
 --
--- Runs ONCE on first PostgreSQL container initialization (empty data dir).
--- Executed AFTER 00-create-app-user.sh (alphabetical order).
--- Safe to re-run: all statements use IF NOT EXISTS / DO $$ ... EXCEPTION.
+-- Runs ONCE via migrations/migrate.sh (tracked in schema_migrations table).
+-- Safe to re-run: all statements use IF NOT EXISTS.
+-- NOT executed at app runtime — only by the dedicated 'migrate' service.
+--
+-- This separation eliminates the deadlock caused by multiple Gunicorn workers
+-- racing to execute DDL against pg's system catalog simultaneously.
 -- =============================================================================
 
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -11,15 +14,15 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- ── Enum types ────────────────────────────────────────────────────────────────
 
 DO $$ BEGIN
-    CREATE TYPE machine_status AS ENUM ('online', 'idle', 'offline');
-EXCEPTION WHEN duplicate_object THEN
-    RAISE NOTICE 'machine_status type already exists, skipping.';
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'machine_status') THEN
+        CREATE TYPE machine_status AS ENUM ('online', 'idle', 'offline');
+    END IF;
 END $$;
 
 DO $$ BEGIN
-    CREATE TYPE user_role AS ENUM ('admin', 'viewer');
-EXCEPTION WHEN duplicate_object THEN
-    RAISE NOTICE 'user_role type already exists, skipping.';
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'user_role') THEN
+        CREATE TYPE user_role AS ENUM ('admin', 'viewer');
+    END IF;
 END $$;
 
 -- ── users ────────────────────────────────────────────────────────────────────
@@ -112,7 +115,9 @@ CREATE TABLE IF NOT EXISTS agent_tokens (
 CREATE INDEX IF NOT EXISTS ix_agent_tokens_machine_id  ON agent_tokens(machine_id);
 CREATE INDEX IF NOT EXISTS ix_agent_tokens_token_hash  ON agent_tokens(token_hash);
 
--- ── updated_at trigger ───────────────────────────────────────────────────────
+-- ── updated_at trigger function ───────────────────────────────────────────────
+-- CREATE OR REPLACE is safe here because this migration runs in a single
+-- transaction via the migrate service — never concurrently with itself.
 
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
@@ -122,8 +127,20 @@ BEGIN
 END;
 $$ LANGUAGE 'plpgsql';
 
-DROP TRIGGER IF EXISTS update_users_updated_at ON users;
-CREATE TRIGGER update_users_updated_at
-    BEFORE UPDATE ON users
-    FOR EACH ROW
-    EXECUTE FUNCTION update_updated_at_column();
+-- Use DO block to create trigger only if it doesn't already exist.
+-- This avoids the DROP TRIGGER + CREATE TRIGGER deadlock that occurs when
+-- multiple workers execute this DDL simultaneously against pg_class.
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM   pg_trigger t
+        JOIN   pg_class  c ON c.oid = t.tgrelid
+        WHERE  t.tgname = 'update_users_updated_at'
+        AND    c.relname = 'users'
+    ) THEN
+        CREATE TRIGGER update_users_updated_at
+            BEFORE UPDATE ON users
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at_column();
+    END IF;
+END $$;

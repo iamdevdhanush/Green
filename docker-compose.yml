@@ -1,25 +1,14 @@
 # =============================================================================
 # GreenOps — Production Docker Compose
 #
-# Single-user PostgreSQL architecture
-# ─────────────────────────────────────
-# POSTGRES_USER (greenops) is both the PostgreSQL superuser and the app user.
-# This matches the existing volume which was initialized with greenops as
-# the sole role — there is no separate "postgres" superuser in this setup.
+# Startup order (enforced by healthchecks and depends_on):
+#   db (healthy) → migrate (exits 0) → server (healthy) → dashboard → nginx
 #
-# How PostgreSQL Docker image handles credentials:
-#   • FIRST RUN (empty data dir): POSTGRES_USER and POSTGRES_PASSWORD are used
-#     to create the role. init-scripts run in alphabetical order.
-#   • SUBSEQUENT RUNS (data dir exists): These env vars are IGNORED by postgres.
-#     The role and its password are already baked into the data volume.
-#
-# Consequence: if you change POSTGRES_PASSWORD in .env after the first run,
-# PostgreSQL still uses the OLD password. To resync:
-#   docker compose down -v   # destroys DB data
-#   docker compose up --build
-#
-# Startup order (enforced by healthchecks):
-#   db (healthy) → server (healthy) → dashboard (healthy) → nginx
+# Key architectural change:
+#   A dedicated 'migrate' one-shot service runs ALL schema DDL before the
+#   application starts. This eliminates the deadlock caused by multiple
+#   Gunicorn workers racing to run CREATE TRIGGER / DROP TRIGGER against
+#   PostgreSQL's system catalog simultaneously.
 #
 # Network policy:
 #   backend  — db + server only. DB never reachable from nginx/dashboard.
@@ -27,6 +16,10 @@
 #
 # Port policy:
 #   ONLY nginx binds a host port (:80). Everything else uses expose.
+#
+# PostgreSQL credential notes:
+#   POSTGRES_USER/PASSWORD are baked into the data volume on first init.
+#   Changing them after first run requires: docker compose down -v && up
 # =============================================================================
 
 services:
@@ -40,20 +33,13 @@ services:
     restart: unless-stopped
 
     environment:
-      # greenops is the PostgreSQL superuser and the app user.
-      # These values are used ONLY on first run (empty data dir).
-      # On subsequent starts, PostgreSQL ignores them — credentials live in the volume.
       POSTGRES_USER:     ${POSTGRES_USER:-greenops}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required. See .env.example}
       POSTGRES_DB:       ${POSTGRES_DB:-greenops}
-
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
 
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # Init scripts run ONCE on first container creation (empty data dir).
-      # On subsequent starts they are skipped entirely.
-      - ./migrations/init-scripts:/docker-entrypoint-initdb.d:ro
 
     networks:
       - backend
@@ -62,8 +48,6 @@ services:
       - "5432"
 
     healthcheck:
-      # pg_isready checks that PostgreSQL accepts connections on POSTGRES_DB.
-      # Uses POSTGRES_USER which exists on both fresh and existing volumes.
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-greenops} -d ${POSTGRES_DB:-greenops} -q"]
       interval: 5s
       timeout: 5s
@@ -76,6 +60,31 @@ services:
           memory: 512M
         reservations:
           memory: 128M
+
+  # ---------------------------------------------------------------------------
+  # Migration runner — one-shot, exits after applying all pending migrations.
+  # The server service will not start until this exits with code 0.
+  # ---------------------------------------------------------------------------
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.migrate
+    container_name: greenops-migrate
+    restart: "no"
+
+    environment:
+      DB_HOST:           db
+      DB_PORT:           "5432"
+      POSTGRES_USER:     ${POSTGRES_USER:-greenops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB:       ${POSTGRES_DB:-greenops}
+
+    depends_on:
+      db:
+        condition: service_healthy
+
+    networks:
+      - backend
 
   # ---------------------------------------------------------------------------
   # FastAPI Backend — Gunicorn + Uvicorn workers
@@ -113,6 +122,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
     networks:
       - backend

@@ -1,0 +1,23 @@
+##############################################################################
+# GreenOps — Dockerfile.migrate
+#
+# One-shot migration runner. Applies all SQL files in migrations/ in order.
+# Exits 0 on success. Docker Compose starts the app only after this exits 0.
+#
+# Uses postgresql-client for psql + pg_isready. No Python, no pip.
+##############################################################################
+
+FROM alpine:3.19
+
+RUN apk add --no-cache postgresql16-client bash
+
+WORKDIR /migrations
+
+COPY migrations/migrate.sh /usr/local/bin/migrate.sh
+RUN chmod +x /usr/local/bin/migrate.sh
+
+# SQL migration files are copied at build time.
+# To add a new migration: add a new .sql file and rebuild the migrate image.
+COPY migrations/*.sql /migrations/
+
+CMD ["/usr/local/bin/migrate.sh"]

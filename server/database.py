@@ -1,32 +1,24 @@
 """
 GreenOps Database Layer
 ========================
-SQLAlchemy async engine, session factory, ORM models, and schema init.
+SQLAlchemy async engine, session factory, ORM models.
 
-Key fix vs original
--------------------
-The original `create_tables()` used:
+Schema management policy
+-------------------------
+ALL DDL (CREATE TABLE, CREATE TYPE, CREATE TRIGGER, CREATE FUNCTION) is
+managed exclusively by the migration service (migrations/init-scripts/).
+The application NEVER runs DDL at runtime.
 
-    DO $$ BEGIN
-        CREATE TYPE machine_status AS ENUM (...);
-    EXCEPTION WHEN duplicate_object THEN null;
-    END $$;
+Rationale:
+  - Multiple Gunicorn workers starting simultaneously all call create_tables().
+  - DDL statements acquire heavyweight locks on pg_class, pg_type, etc.
+  - Even with IF NOT EXISTS guards, concurrent DROP TRIGGER + CREATE TRIGGER
+    causes a DeadlockDetectedError on pg's system catalog.
+  - The fix: separate concerns. Migrations run once, before the app starts,
+    in a dedicated one-shot container. The app only reads/writes data.
 
-When 4 Gunicorn workers all call create_tables() at the same millisecond on
-first boot, they all attempt CREATE TYPE simultaneously.  The duplicate key
-hits pg_type's storage-level unique index BEFORE PL/pgSQL's EXCEPTION handler
-fires → one worker crashes with IntegrityError → Gunicorn kills all workers.
-
-Fixed by checking existence first:
-
-    DO $$
-    BEGIN
-        IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'machine_status') THEN
-            CREATE TYPE machine_status AS ENUM (...);
-        END IF;
-    END $$;
-
-Workers that lose the race simply skip the CREATE instead of raising an error.
+create_tables() is kept for backwards compatibility but now only verifies
+the schema is present — it does not modify it.
 """
 
 import enum
@@ -59,11 +51,11 @@ from config import get_settings
 
 logger = structlog.get_logger(__name__)
 
+settings = get_settings()
+
 # ---------------------------------------------------------------------------
 # Engine & session factory
 # ---------------------------------------------------------------------------
-
-settings = get_settings()
 
 engine = create_async_engine(
     settings.DATABASE_URL,
@@ -249,193 +241,49 @@ class AgentToken(Base):
 
 
 # ---------------------------------------------------------------------------
-# Schema initialisation — called once per worker at startup
+# Schema verification — NOT schema creation
 # ---------------------------------------------------------------------------
 
-async def create_tables() -> None:
+async def verify_schema() -> None:
     """
-    Create enum types and tables if they don't already exist.
+    Verify that required tables exist. Raises RuntimeError if the schema
+    is not present (migrations have not run).
 
-    Multi-worker safety
-    -------------------
-    Uses IF NOT EXISTS guards on enum creation so that concurrent workers
-    racing to call this function on first boot don't cause each other to
-    crash with IntegrityError on pg_type's unique index.
+    This function does NOT create any tables, types, functions, or triggers.
+    All DDL is managed by migrations/init-scripts/ which run in the
+    dedicated 'migrate' service before the app container starts.
 
-    The EXCEPTION WHEN duplicate_object pattern is NOT used here because
-    asyncpg raises the error at the storage level before PL/pgSQL's
-    exception handler fires, causing spurious worker crashes.
+    Why no DDL here:
+      Multiple Gunicorn workers call this function concurrently at startup.
+      Even IF-NOT-EXISTS DDL acquires heavy locks on pg_class/pg_type, and
+      DROP TRIGGER + CREATE TRIGGER in particular causes deadlocks between
+      workers competing for the same system catalog entries.
     """
-    async with engine.begin() as conn:
-        # ── Enum: machine_status ───────────────────────────────────────────
-        # Check existence before attempting CREATE to avoid concurrent-worker
-        # race on pg_type's unique index.
-        await conn.execute(text("""
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM pg_type WHERE typname = 'machine_status'
-                ) THEN
-                    CREATE TYPE machine_status AS ENUM ('online', 'idle', 'offline');
-                END IF;
-            END $$;
-        """))
+    required_tables = ["users", "machines", "heartbeats", "agent_tokens", "refresh_tokens"]
 
-        # ── Enum: user_role ───────────────────────────────────────────────
-        await conn.execute(text("""
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM pg_type WHERE typname = 'user_role'
-                ) THEN
-                    CREATE TYPE user_role AS ENUM ('admin', 'viewer');
-                END IF;
-            END $$;
-        """))
+    async with engine.connect() as conn:
+        for table in required_tables:
+            result = await conn.execute(
+                text(
+                    "SELECT EXISTS ("
+                    "  SELECT FROM information_schema.tables"
+                    "  WHERE table_schema = 'public' AND table_name = :tname"
+                    ")"
+                ),
+                {"tname": table},
+            )
+            exists = result.scalar()
+            if not exists:
+                raise RuntimeError(
+                    f"Required table '{table}' does not exist. "
+                    "Ensure the 'migrate' service completed successfully before "
+                    "starting the application. "
+                    "Run: docker compose run --rm migrate"
+                )
 
-        # ── Tables ────────────────────────────────────────────────────────
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS users (
-                id                    SERIAL PRIMARY KEY,
-                username              VARCHAR(64) UNIQUE NOT NULL,
-                password_hash         VARCHAR(256) NOT NULL,
-                role                  user_role NOT NULL DEFAULT 'admin',
-                is_active             BOOLEAN NOT NULL DEFAULT true,
-                failed_login_attempts INTEGER NOT NULL DEFAULT 0,
-                locked_until          TIMESTAMPTZ,
-                last_login            TIMESTAMPTZ,
-                created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-        """))
+    logger.info("database_schema_verified", tables=required_tables)
 
-        await conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS ix_users_username ON users(username);
-        """))
 
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS refresh_tokens (
-                id         SERIAL PRIMARY KEY,
-                user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                token_hash VARCHAR(256) UNIQUE NOT NULL,
-                issued_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                expires_at TIMESTAMPTZ NOT NULL,
-                revoked    BOOLEAN NOT NULL DEFAULT false,
-                revoked_at TIMESTAMPTZ,
-                user_agent VARCHAR(256),
-                ip_address VARCHAR(64)
-            );
-        """))
-
-        await conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS ix_refresh_tokens_user_id
-                ON refresh_tokens(user_id);
-        """))
-
-        await conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS ix_refresh_tokens_token_hash
-                ON refresh_tokens(token_hash);
-        """))
-
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS machines (
-                id                   SERIAL PRIMARY KEY,
-                mac_address          VARCHAR(17) UNIQUE NOT NULL,
-                hostname             VARCHAR(255) NOT NULL,
-                os_type              VARCHAR(64) NOT NULL,
-                os_version           VARCHAR(128),
-                ip_address           VARCHAR(64),
-                status               machine_status NOT NULL DEFAULT 'offline',
-                first_seen           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                last_seen            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                total_idle_seconds   BIGINT NOT NULL DEFAULT 0,
-                total_active_seconds BIGINT NOT NULL DEFAULT 0,
-                energy_wasted_kwh    DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-                energy_cost_usd      DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-                agent_version        VARCHAR(32),
-                notes                TEXT
-            );
-        """))
-
-        await conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS ix_machines_mac_address
-                ON machines(mac_address);
-        """))
-
-        await conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS ix_machines_status
-                ON machines(status);
-        """))
-
-        await conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS ix_machines_status_last_seen
-                ON machines(status, last_seen);
-        """))
-
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS heartbeats (
-                id               BIGSERIAL PRIMARY KEY,
-                machine_id       INTEGER NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
-                timestamp        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                idle_seconds     INTEGER NOT NULL DEFAULT 0,
-                cpu_usage        DOUBLE PRECISION,
-                memory_usage     DOUBLE PRECISION,
-                is_idle          BOOLEAN NOT NULL DEFAULT false,
-                energy_delta_kwh DOUBLE PRECISION NOT NULL DEFAULT 0.0
-            );
-        """))
-
-        await conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS ix_heartbeats_machine_id_timestamp
-                ON heartbeats(machine_id, timestamp DESC);
-        """))
-
-        await conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS ix_heartbeats_timestamp
-                ON heartbeats(timestamp DESC);
-        """))
-
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS agent_tokens (
-                id         SERIAL PRIMARY KEY,
-                machine_id INTEGER NOT NULL UNIQUE REFERENCES machines(id) ON DELETE CASCADE,
-                token_hash VARCHAR(256) UNIQUE NOT NULL,
-                issued_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                last_used  TIMESTAMPTZ,
-                revoked    BOOLEAN NOT NULL DEFAULT false
-            );
-        """))
-
-        await conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS ix_agent_tokens_machine_id
-                ON agent_tokens(machine_id);
-        """))
-
-        await conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS ix_agent_tokens_token_hash
-                ON agent_tokens(token_hash);
-        """))
-
-        # ── updated_at trigger ────────────────────────────────────────────
-        await conn.execute(text("""
-            CREATE OR REPLACE FUNCTION update_updated_at_column()
-            RETURNS TRIGGER AS $$
-            BEGIN
-                NEW.updated_at = NOW();
-                RETURN NEW;
-            END;
-            $$ LANGUAGE 'plpgsql';
-        """))
-
-        await conn.execute(text("""
-            DROP TRIGGER IF EXISTS update_users_updated_at ON users;
-        """))
-
-        await conn.execute(text("""
-            CREATE TRIGGER update_users_updated_at
-                BEFORE UPDATE ON users
-                FOR EACH ROW
-                EXECUTE FUNCTION update_updated_at_column();
-        """))
-
-    logger.info("database_schema_ready")
+# Keep the old name as an alias so existing imports don't break during
+# the transition. Both point to the same verification-only function.
+create_tables = verify_schema
