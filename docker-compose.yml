@@ -39,7 +39,6 @@ services:
       POSTGRES_PASSWORD:          ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       POSTGRES_DB:                ${POSTGRES_DB:-greenops}
       POSTGRES_INITDB_ARGS:       "--encoding=UTF8 --locale=C"
-      # Tune shared_buffers for small VPS (256MB RAM allocation to PG)
       POSTGRES_HOST_AUTH_METHOD:  scram-sha-256
 
     volumes:
@@ -52,8 +51,9 @@ services:
       - backend
 
     # expose = internal Docker network only. NOT a host port binding.
-    ports:
-      - "8000:8000"
+    # PostgreSQL listens on 5432 — do NOT bind to host or use port 8000.
+    expose:
+      - "5432"
 
     healthcheck:
       # pg_isready checks that PostgreSQL is accepting connections.
@@ -78,7 +78,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.server
-      # Cache busting: rebuild if requirements change
       args:
         BUILDKIT_INLINE_CACHE: "1"
     container_name: greenops-server
@@ -120,8 +119,6 @@ services:
       - "8000"
 
     healthcheck:
-      # The /health endpoint checks DB connectivity internally.
-      # curl -f returns exit code 22 on HTTP 4xx/5xx, exit code 7 on connection refused.
       test: ["CMD-SHELL", "curl -sf http://localhost:8000/health | grep -q '\"status\":\"healthy\"' || exit 1"]
       interval: 10s
       timeout: 8s

@@ -1,8 +1,14 @@
-i##############################################################################
+##############################################################################
 # GreenOps — Dockerfile.nginx
 #
 # Removes the default nginx conf (which conflicts with our custom conf)
 # and copies our nginx.conf + conf.d/ into the image.
+#
+# NOTE: We do NOT run `nginx -t` at build time because the upstream hostnames
+# (server:8000, dashboard:3000) are Docker network aliases that only exist
+# when all containers are running. Build-time validation would always fail
+# with "host not found in upstream". Config correctness is verified at
+# container startup when the network is available.
 ##############################################################################
 
 FROM nginx:1.25-alpine
@@ -17,9 +23,6 @@ COPY nginx/conf.d/         /etc/nginx/conf.d/
 
 # Cert directory (empty on first run; mounted as volume in compose)
 RUN mkdir -p /etc/nginx/certs
-
-# Validate config at build time — catches syntax errors before deployment
-RUN nginx -t
 
 RUN mkdir -p /var/log/nginx \
     && touch /var/log/nginx/access.log /var/log/nginx/error.log
