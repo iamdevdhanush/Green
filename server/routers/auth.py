@@ -1,25 +1,22 @@
 """
 GreenOps Authentication Router
 ================================
-Endpoints
----------
+Endpoints:
   POST /api/auth/login     — exchange credentials for access + refresh tokens
   POST /api/auth/refresh   — rotate refresh token, get new access token
   POST /api/auth/logout    — revoke refresh token
   GET  /api/auth/verify    — validate current access token
   GET  /api/auth/me        — current user info
 
-Startup helper
---------------
+Startup helper:
   ensure_admin_exists(db)  — idempotent, multi-worker-safe admin bootstrap
 
-Multi-worker safety
--------------------
-Gunicorn spawns N UvicornWorker processes; each runs the ASGI lifespan
-independently, so ensure_admin_exists() is called N times concurrently.
-We serialize via a PostgreSQL session-level advisory lock so exactly one
-worker performs the INSERT; the rest detect the already-existing row and
-return immediately without touching the database.
+Admin seeding policy:
+  - Default credentials: admin / admin123 (documented, deterministic)
+  - Password is hashed with Argon2id and stored in the database
+  - If admin already exists, NO changes are made — existing password preserved
+  - Credentials are NEVER auto-generated or randomly changed
+  - Password must be changed from the dashboard settings after first login
 """
 
 from datetime import datetime, timezone, timedelta
@@ -48,34 +45,33 @@ logger = structlog.get_logger(__name__)
 router = APIRouter()
 
 ACCOUNT_LOCKOUT_THRESHOLD = 10
-ACCOUNT_LOCKOUT_MINUTES = 15
+ACCOUNT_LOCKOUT_MINUTES   = 15
 
-# Arbitrary but stable integer key for pg_advisory_xact_lock.
-# Must be the same across all workers in the same PostgreSQL database.
-# Range: any 64-bit signed integer.
-_ADMIN_INIT_LOCK_KEY: int = 0x6772656E6F707361  # "greenopsa" in hex
+# Stable advisory lock key — same value across all workers in the same DB instance.
+# Any 64-bit signed integer; this spells "greenopsa" in hex.
+_ADMIN_INIT_LOCK_KEY: int = 0x6772656E6F707361
 
 
 # ---------------------------------------------------------------------------
-# Helper: safely coerce a raw string or enum to UserRole
+# Helper: coerce raw string or enum to UserRole
 # ---------------------------------------------------------------------------
 
 def _coerce_role(value) -> UserRole:
     """
-    Accept a UserRole member OR a string and always return a UserRole member.
+    Accept a UserRole member OR a string and return a UserRole member.
+    Normalises case via UserRole._missing_().
 
-    Examples
-    --------
-    _coerce_role(UserRole.ADMIN)  -> UserRole.ADMIN
-    _coerce_role("admin")         -> UserRole.ADMIN
-    _coerce_role("ADMIN")         -> UserRole.ADMIN  (normalised via _missing_)
-    _coerce_role("superuser")     -> raises ValueError
+    Examples:
+        _coerce_role(UserRole.ADMIN)  → UserRole.ADMIN
+        _coerce_role("admin")         → UserRole.ADMIN
+        _coerce_role("ADMIN")         → UserRole.ADMIN  (normalised)
+        _coerce_role("superuser")     → raises ValueError
     """
     if isinstance(value, UserRole):
         return value
     if isinstance(value, str):
-        return UserRole(value)   # _missing_ handles case-insensitive normalisation
-    raise ValueError(f"Cannot coerce type {type(value)!r} to UserRole")
+        return UserRole(value)
+    raise ValueError(f"Cannot coerce {type(value)!r} to UserRole")
 
 
 # ---------------------------------------------------------------------------
@@ -93,12 +89,12 @@ class LoginRequest(BaseModel):
 
 
 class LoginResponse(BaseModel):
-    access_token: str
+    access_token:  str
     refresh_token: str
-    token_type: str = "bearer"
-    expires_at: datetime
-    role: str
-    username: str
+    token_type:    str = "bearer"
+    expires_at:    datetime
+    role:          str
+    username:      str
 
 
 class RefreshRequest(BaseModel):
@@ -107,8 +103,8 @@ class RefreshRequest(BaseModel):
 
 class TokenResponse(BaseModel):
     access_token: str
-    token_type: str = "bearer"
-    expires_at: datetime
+    token_type:   str = "bearer"
+    expires_at:   datetime
 
 
 # ---------------------------------------------------------------------------
@@ -133,8 +129,9 @@ async def login(
     user = result.scalar_one_or_none()
 
     # ── 2. Unknown user / inactive ─────────────────────────────────────────
-    # IMPORTANT: always call timing_safe_dummy_verify() before returning 401
-    # so that "user not found" and "wrong password" paths take the same time.
+    # Always call timing_safe_dummy_verify() before returning 401 so that
+    # "user not found" and "wrong password" paths take the same time (~100ms).
+    # Without this, username enumeration is trivial via timing.
     if not user or not user.is_active:
         timing_safe_dummy_verify()
         logger.warning(
@@ -190,7 +187,7 @@ async def login(
     user.locked_until = None
     user.last_login = datetime.now(timezone.utc)
 
-    # Silently upgrade hash if parameters have changed since it was stored.
+    # Silently upgrade hash if Argon2id parameters have changed.
     if needs_rehash(user.password_hash):
         user.password_hash = hash_password(payload.password)
         logger.info("password_rehashed", username=user.username)
@@ -266,10 +263,10 @@ async def refresh_token(
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": "user_inactive", "message": "User inactive."},
+            detail={"error": "user_inactive", "message": "User inactive or not found."},
         )
 
-    # Token rotation: revoke old, issue new access token.
+    # Token rotation: revoke old token, issue new access token.
     db_token.revoked = True
     db_token.revoked_at = datetime.now(timezone.utc)
 
@@ -310,23 +307,19 @@ async def logout(
 
 @router.get("/verify")
 async def verify_token(current_user: User = Depends(get_current_user)):
-    """Verify the current access token is valid."""
+    """Verify the current access token is valid and return basic user info."""
     role_value = _coerce_role(current_user.role).value
-    return {
-        "valid": True,
-        "username": current_user.username,
-        "role": role_value,
-    }
+    return {"valid": True, "username": current_user.username, "role": role_value}
 
 
 @router.get("/me")
 async def get_me(current_user: User = Depends(get_current_user)):
-    """Get current authenticated user info."""
+    """Return the current authenticated user's profile."""
     role_value = _coerce_role(current_user.role).value
     return {
-        "id": current_user.id,
-        "username": current_user.username,
-        "role": role_value,
+        "id":         current_user.id,
+        "username":   current_user.username,
+        "role":       role_value,
         "last_login": current_user.last_login,
         "created_at": current_user.created_at,
     }
@@ -338,52 +331,58 @@ async def get_me(current_user: User = Depends(get_current_user)):
 
 async def ensure_admin_exists(db: AsyncSession) -> None:
     """
-    Guarantee exactly one admin user exists. Safe to call concurrently from
-    multiple Gunicorn workers because it uses a PostgreSQL session-level
-    advisory lock to serialize the check-then-insert operation.
+    Guarantee exactly one admin user exists with the configured credentials.
+    Safe to call concurrently from multiple Gunicorn workers.
 
-    Advisory lock guarantee
-    -----------------------
-    pg_advisory_xact_lock(key) blocks until the lock is acquired and releases
-    it automatically at the end of the transaction. Because all workers share
-    the same PostgreSQL server, exactly one worker proceeds at a time.
+    Admin seeding policy
+    ─────────────────────
+    1. Default credentials: username=admin, password=admin123 (from .env defaults)
+    2. If INITIAL_ADMIN_USERNAME / INITIAL_ADMIN_PASSWORD are set in .env, those
+       values are used instead.
+    3. If the admin user ALREADY EXISTS, this function makes NO changes.
+       The existing password is preserved regardless of INITIAL_ADMIN_PASSWORD.
+       To change the password, use the dashboard settings page.
+    4. Credentials are NEVER auto-generated. If INITIAL_ADMIN_PASSWORD is
+       missing or empty, the code defaults to "admin123" (same as the config default).
 
-    Timeline (4 workers, no existing admin):
-      W1 acquires lock → SELECT → None → INSERT → COMMIT (lock released)
-      W2 acquires lock → SELECT → finds row created by W1 → returns early
-      W3, W4: same as W2.
+    Multi-worker safety
+    ─────────────────────
+    pg_advisory_xact_lock(key) blocks until the lock is acquired and is released
+    automatically at the end of the transaction. All workers share the same
+    PostgreSQL server, so exactly one worker proceeds at a time.
 
-    Password determinism
-    --------------------
-    INITIAL_ADMIN_PASSWORD must be set in .env for production. Default is
-    'admin123' per .env.example. Credentials can only be changed from the
-    dashboard settings after first login.
+    Timeline (4 Gunicorn workers, no existing admin):
+      W1: acquires lock → SELECT None → INSERT → COMMIT → lock released
+      W2: acquires lock → SELECT finds W1's row → returns immediately
+      W3, W4: same as W2
     """
     from config import get_settings
     settings = get_settings()
 
     try:
-        # ── Step 0: Verify the PostgreSQL enum exists (schema sanity check) ──
+        # ── Step 0: Sanity-check that the PostgreSQL enum type exists ──────
+        # If the migration hasn't run, we get a clear error here rather than
+        # a cryptic "invalid input value" failure later.
         try:
             await db.execute(text("SELECT 'admin'::user_role"))
         except DBAPIError as exc:
             logger.error(
                 "startup_enum_check_failed",
-                detail=(
-                    "PostgreSQL user_role enum is missing or doesn't contain 'admin'. "
-                    "Run migration 001_initial_schema.sql."
+                hint=(
+                    "The 'user_role' PostgreSQL enum type does not exist or does "
+                    "not contain 'admin'. Ensure migrations/init-scripts/01-initial-schema.sql "
+                    "ran successfully on first boot."
                 ),
-                original_error=str(exc),
+                error=str(exc),
             )
             await db.rollback()
             raise
 
-        # ── Step 1: Acquire a session-level advisory lock ─────────────────
-        # This serialises all workers. The lock is held until db.commit() or
-        # db.rollback() — whichever happens first in this function.
+        # ── Step 1: Acquire PostgreSQL session-level advisory lock ────────
+        # Serialises the check-then-insert across all concurrent workers.
         await db.execute(text(f"SELECT pg_advisory_xact_lock({_ADMIN_INIT_LOCK_KEY})"))
 
-        # ── Step 2: Re-check for existing admin AFTER acquiring the lock ──
+        # ── Step 2: Check for existing admin (with lock held) ─────────────
         admin_username = settings.INITIAL_ADMIN_USERNAME.strip().lower()
 
         result = await db.execute(
@@ -396,55 +395,49 @@ async def ensure_admin_exists(db: AsyncSession) -> None:
                 "admin_already_exists",
                 username=admin_username,
                 role=_coerce_role(existing.role).value,
+                note="Existing password is preserved. Use the dashboard to change it.",
             )
             await db.commit()
             return
 
-        # ── Step 3: Determine the password ───────────────────────────────
-        admin_password = settings.INITIAL_ADMIN_PASSWORD
-        generated_password = False
+        # ── Step 3: Determine password — NEVER auto-generate ─────────────
+        # Use INITIAL_ADMIN_PASSWORD from .env; fall back to "admin123".
+        # This is deterministic and reproducible across deployments.
+        admin_password = settings.INITIAL_ADMIN_PASSWORD or "admin123"
 
-        if not admin_password:
-            import secrets as _secrets
-            admin_password = _secrets.token_urlsafe(16)
-            generated_password = True
+        if admin_password == "admin123":
             logger.warning(
-                "admin_password_auto_generated",
-                password=admin_password,
+                "admin_using_default_password",
                 username=admin_username,
-                action_required=(
-                    "Set INITIAL_ADMIN_PASSWORD in .env to avoid this. "
-                    "This password will NOT be logged again."
-                ),
+                action_required="Change this password after first login via the dashboard.",
             )
 
         # ── Step 4: Create the admin user ─────────────────────────────────
         admin = User(
             username=admin_username,
             password_hash=hash_password(admin_password),
-            role=UserRole.ADMIN,       # enum member, not a raw string
+            role=UserRole.ADMIN,   # Always use the enum member, never a raw string
             is_active=True,
         )
         db.add(admin)
 
-        # Commit also releases the pg_advisory_xact_lock.
+        # COMMIT also releases the pg_advisory_xact_lock.
         await db.commit()
 
         logger.info(
             "admin_user_created",
             username=admin_username,
             role=UserRole.ADMIN.value,
-            password_source="auto_generated" if generated_password else "INITIAL_ADMIN_PASSWORD",
         )
 
     except IntegrityError:
-        # Extremely unlikely given the advisory lock, but handle anyway:
-        # a concurrent INSERT slipped through (e.g. direct DB manipulation).
+        # Extremely rare with the advisory lock in place, but handled defensively.
+        # A concurrent INSERT could happen if someone inserted outside this flow.
         await db.rollback()
         logger.info(
-            "admin_creation_skipped_integrity_error",
+            "admin_creation_skipped",
+            reason="IntegrityError — row already existed when we tried to insert.",
             username=settings.INITIAL_ADMIN_USERNAME.strip().lower(),
-            reason="row already existed by the time we tried to insert",
         )
 
     except DBAPIError as exc:
@@ -452,12 +445,13 @@ async def ensure_admin_exists(db: AsyncSession) -> None:
         logger.error(
             "ensure_admin_exists_db_error",
             error=str(exc),
-            detail=(
-                "DB-level error during admin bootstrap. Common causes: "
-                "enum mismatch, DB not ready, missing migration."
+            hint=(
+                "Database-level error during admin bootstrap. Common causes: "
+                "enum type missing (run migrations), DB not accepting connections, "
+                "schema mismatch."
             ),
         )
-        raise  # propagate — lifespan will call sys.exit(1)
+        raise  # Propagate — main.py lifespan will call sys.exit(1)
 
     except Exception as exc:
         await db.rollback()
